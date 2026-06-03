@@ -14,6 +14,38 @@ the standard library (optional `rich` for prettier output).
 - systemd (for timer-based renewal)
 - Root access for write operations
 
+## Installing lego
+
+**OpenSUSE MicroOS / Aeon / Kalpa** (requires reboot to apply):
+```bash
+sudo transactional-update pkg install lego
+sudo systemctl reboot
+```
+
+**OpenSUSE Leap / Tumbleweed:**
+```bash
+sudo zypper install lego
+```
+
+**Fedora / RHEL / Rocky / Alma:**
+```bash
+sudo dnf install lego
+```
+
+**Debian / Ubuntu:**
+```bash
+sudo apt install lego
+```
+
+**macOS (Homebrew):**
+```bash
+brew install lego
+```
+
+Or download a pre-built binary from the
+[lego releases page](https://github.com/go-acme/lego/releases) and place it
+somewhere in your `PATH`.
+
 ## Quick Start
 
 ```bash
@@ -117,10 +149,25 @@ journalctl -u acme@mysite.service
 
 ## Optional: rich output
 
-Install `python3-rich` for coloured tables and progress indicators:
+Install `python3-rich` for coloured tables and progress indicators.
+Falls back to plain ASCII tables if not available.
 
+**OpenSUSE MicroOS / Aeon / Kalpa** (requires reboot):
 ```bash
 sudo transactional-update pkg install python3-rich
 ```
 
-Falls back to plain ASCII tables if not available.
+**OpenSUSE Leap / Tumbleweed:**
+```bash
+sudo zypper install python3-rich
+```
+
+**Fedora / RHEL:**
+```bash
+sudo dnf install python3-rich
+```
+
+**Debian / Ubuntu:**
+```bash
+sudo apt install python3-rich
+```
