@@ -1,0 +1,17 @@
+[Unit]
+Description=ACME certificate renewal for %i using lego
+
+[Service]
+Type=oneshot
+# Default to Let's Encrypt; override with LEGO_SERVER in /etc/acme/acme.conf
+Environment=LEGO_SERVER=https://acme-v02.api.letsencrypt.org/directory
+EnvironmentFile=-/etc/acme/acme.conf
+EnvironmentFile=-/etc/acme/%i.env
+WorkingDirectory=/var/lib/acme
+ExecStart=/usr/bin/lego --accept-tos \
+  --path /var/lib/acme \
+  --server ${LEGO_SERVER} \
+  $DOMAINS \
+  --dns ${LEGO_DNS} \
+  renew \
+  --run-hook "${HOOK}"
