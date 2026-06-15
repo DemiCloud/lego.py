@@ -17,7 +17,7 @@ import sys
 import textwrap
 import typing
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __prog__ = "lego.py"
 __description__ = "ACME certificate management using the lego CLI"
 
@@ -41,7 +41,8 @@ EXPIRY_CRIT_DAYS = 15
 # Embedded templates (keep in sync with the systemd/ directory in the repo)
 # ---------------------------------------------------------------------------
 
-_UNIT_SERVICE = """\
+# lego v4 syntax: global flags come before the subcommand; renewal uses 'renew'
+_UNIT_SERVICE_V4 = """\
 [Unit]
 Description=ACME certificate renewal for %i using lego
 
@@ -60,6 +61,28 @@ ExecStart=/usr/bin/lego --accept-tos \\
   --dns.resolvers ${LEGO_DNS_RESOLVERS} \\
   renew \\
   --run-hook "${HOOK}"
+"""
+
+# lego v5 syntax: all flags move under the 'run' subcommand; --deploy-hook replaces --run-hook
+_UNIT_SERVICE_V5 = """\
+[Unit]
+Description=ACME certificate renewal for %i using lego
+
+[Service]
+Type=oneshot
+# Default to Let's Encrypt; override with LEGO_SERVER in /etc/acme/acme.conf
+Environment=LEGO_SERVER=https://acme-v02.api.letsencrypt.org/directory
+EnvironmentFile=-/etc/acme/acme.conf
+EnvironmentFile=-/etc/acme/%i.env
+WorkingDirectory=/var/lib/acme
+ExecStart=/usr/bin/lego run \\
+  --accept-tos \\
+  --path /var/lib/acme \\
+  --server ${LEGO_SERVER} \\
+  $DOMAINS \\
+  --dns ${LEGO_DNS} \\
+  --dns.resolvers ${LEGO_DNS_RESOLVERS} \\
+  --deploy-hook "${HOOK}"
 """
 
 _UNIT_TIMER = """\
@@ -459,6 +482,22 @@ def require_root() -> None:
         sys.exit(1)
 
 
+def _lego_version(lego: pathlib.Path) -> tuple[int, int, int]:
+    """Return (major, minor, patch) for the lego binary, or (0, 0, 0) on failure."""
+    try:
+        result = subprocess.run(
+            [str(lego), "--version"],
+            capture_output=True,
+            text=True,
+        )
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout + result.stderr)
+        if m:
+            return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except FileNotFoundError:
+        pass
+    return (0, 0, 0)
+
+
 # ---------------------------------------------------------------------------
 # lego list parsing
 # ---------------------------------------------------------------------------
@@ -515,11 +554,18 @@ def _parse_lego_list(raw: str) -> dict[str, _LegoCert]:
     return certs
 
 
-def _run_lego_list(lego: pathlib.Path) -> dict[str, _LegoCert]:
-    """Run ``lego --path <ACME_WORK_DIR> list`` and return parsed results."""
+def _run_lego_list(
+    lego: pathlib.Path,
+    lego_ver: tuple[int, int, int],
+) -> dict[str, _LegoCert]:
+    """Run ``lego [certificates] list`` and return parsed results."""
+    if lego_ver >= (5, 0, 0):
+        list_cmd = [str(lego), "certificates", "list", "--path", str(ACME_WORK_DIR)]
+    else:
+        list_cmd = [str(lego), "--path", str(ACME_WORK_DIR), "list"]
     try:
         result = subprocess.run(
-            [str(lego), "--path", str(ACME_WORK_DIR), "list"],
+            list_cmd,
             capture_output=True,
             text=True,
         )
@@ -587,13 +633,20 @@ def _build_lego_issue_cmd(
     conf: dict[str, str],
     domains: list[str],
     hook: str,
+    lego_ver: tuple[int, int, int],
 ) -> list[str]:
     """Build the ``lego run`` argument list for initial certificate issuance.
 
     DNS provider credentials are expected in the subprocess environment, not
     here — pass the merged config dict as ``env=`` when calling subprocess.run.
     """
-    cmd = [str(lego), "--accept-tos", "--path", str(ACME_WORK_DIR)]
+    v5 = lego_ver >= (5, 0, 0)
+
+    # v5 moved all flags under the 'run' subcommand; v4 had them as global flags.
+    if v5:
+        cmd = [str(lego), "run", "--accept-tos", "--path", str(ACME_WORK_DIR)]
+    else:
+        cmd = [str(lego), "--accept-tos", "--path", str(ACME_WORK_DIR)]
 
     if server := conf.get("LEGO_SERVER"):
         cmd += ["--server", server]
@@ -606,11 +659,10 @@ def _build_lego_issue_cmd(
     cmd += ["--dns", conf["LEGO_DNS"]]
 
     if conf.get("LEGO_EAB", "").lower() == "true":
-        cmd += [
-            "--eab",
-            "--kid", conf["LEGO_EAB_KID"],
-            "--hmac", conf["LEGO_EAB_HMAC"],
-        ]
+        if v5:
+            cmd += ["--eab", "--eab.kid", conf["LEGO_EAB_KID"], "--eab.hmac", conf["LEGO_EAB_HMAC"]]
+        else:
+            cmd += ["--eab", "--kid", conf["LEGO_EAB_KID"], "--hmac", conf["LEGO_EAB_HMAC"]]
 
     if conf.get("LEGO_PFX", "").lower() == "true":
         cmd += ["--pfx", "--pfx.password", conf.get("LEGO_PFX_PASSWORD", "")]
@@ -622,10 +674,13 @@ def _build_lego_issue_cmd(
     ):
         cmd += ["--dns.resolvers", resolver]
 
-    cmd.append("run")
-
-    if hook:
-        cmd += ["--run-hook", hook]
+    if v5:
+        if hook:
+            cmd += ["--deploy-hook", hook]
+    else:
+        cmd.append("run")
+        if hook:
+            cmd += ["--run-hook", hook]
 
     return cmd
 
@@ -845,9 +900,16 @@ def cmd_install(args: argparse.Namespace, output: Output) -> int:
     """Create directories and install systemd unit templates."""
     require_root()
 
-    if shutil.which("lego") is None:
+    lego_bin = shutil.which("lego")
+    if lego_bin is None:
         output.step("warning", "lego not found in PATH — install it before issuing certificates.")
         output.step("hint", f"See: {WIKI_INSTALL_URL}")
+        lego_ver: tuple[int, int, int] = (5, 0, 0)  # assume current version
+    else:
+        lego_ver = _lego_version(pathlib.Path(lego_bin))
+        output.step("ok", f"lego {'.'.join(str(x) for x in lego_ver)} detected")
+
+    unit_service = _UNIT_SERVICE_V5 if lego_ver >= (5, 0, 0) else _UNIT_SERVICE_V4
 
     for directory, mode in (
         (ACME_DIR, 0o755),
@@ -857,7 +919,7 @@ def cmd_install(args: argparse.Namespace, output: Output) -> int:
         output.step("directory", str(directory))
 
     for unit_name, content in (
-        ("acme@.service", _UNIT_SERVICE),
+        ("acme@.service", unit_service),
         ("acme@.timer", _UNIT_TIMER),
     ):
         dest = SYSTEMD_DIR / unit_name
@@ -943,7 +1005,8 @@ def cmd_issue(args: argparse.Namespace, output: Output) -> int:
         )
         return 1
 
-    cmd = _build_lego_issue_cmd(lego, conf, domains, conf.get("HOOK", ""))
+    lego_ver = _lego_version(lego)
+    cmd = _build_lego_issue_cmd(lego, conf, domains, conf.get("HOOK", ""), lego_ver)
     log.debug("lego command: %s", " ".join(cmd))
 
     # Merge config into subprocess env so provider credentials are available.
@@ -1001,8 +1064,9 @@ def cmd_renew(args: argparse.Namespace, output: Output) -> int:
 def cmd_status(args: argparse.Namespace, output: Output) -> int:
     """Show expiry and timer status for all configured certificates."""
     lego = require_lego()
+    lego_ver = _lego_version(lego)
 
-    issued = _run_lego_list(lego)
+    issued = _run_lego_list(lego, lego_ver)
     instances = load_instance_configs()
 
     if not issued and not instances:
