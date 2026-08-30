@@ -1222,6 +1222,7 @@ def _load_lego_conf(instance: str) -> tuple[dict[str, str], list[str]] | None:
 
 def _run_lego(
     lego: pathlib.Path,
+    instance: str,
     conf: dict[str, str],
     domains: list[str],
     action: typing.Literal["issue", "renew"],
@@ -1234,6 +1235,18 @@ def _run_lego(
     # Merge config into subprocess env so provider credentials are available.
     env = os.environ.copy()
     env.update(conf)
+
+    # Stable, version-independent vars for the user's HOOK script. lego itself
+    # renamed its hook vars between v4 (LEGO_CERT_PATH) and v5
+    # (LEGO_HOOK_CERT_PATH) — computing these ourselves from CERT_DIR, which
+    # this tool already controls via --path, means hook scripts never need to
+    # track lego's internal naming across future version bumps either.
+    primary = domains[0]
+    env["LEGO_PY_INSTANCE"] = instance
+    env["LEGO_PY_DOMAIN"] = primary
+    env["LEGO_PY_CERT_PATH"] = str(CERT_DIR / f"{primary}.crt")
+    env["LEGO_PY_CERT_KEY_PATH"] = str(CERT_DIR / f"{primary}.key")
+    env["LEGO_PY_CERT_ISSUER_PATH"] = str(CERT_DIR / f"{primary}.issuer.crt")
 
     try:
         subprocess.run(cmd, check=True, env=env)
@@ -1265,7 +1278,7 @@ def cmd_issue(args: argparse.Namespace, output: Output) -> int:
         return 1
 
     log.info("issuing certificate for instance %r (%s)...", instance, domains[0])
-    if _run_lego(lego, conf, domains, "issue") != 0:
+    if _run_lego(lego, instance, conf, domains, "issue") != 0:
         return 1
 
     # Enable and start the renewal timer now that a cert exists.
@@ -1301,7 +1314,7 @@ def cmd_renew_exec(args: argparse.Namespace, output: Output) -> int:
     conf, domains = loaded
 
     log.info("renewing certificate for instance %r (%s)...", instance, domains[0])
-    return _run_lego(lego, conf, domains, "renew")
+    return _run_lego(lego, instance, conf, domains, "renew")
 
 
 def cmd_renew(args: argparse.Namespace, output: Output) -> int:

@@ -176,6 +176,18 @@ DOMAINS="-d foo.example.com -d bar.example.com"
 HOOK="/path/to/deploy-hook.sh"   # optional; runs after successful renewal
 ```
 
+`HOOK` is invoked with these environment variables set, regardless of the
+installed lego version (`lego.py` computes them itself rather than relying
+on lego's own hook variables, which were renamed between v4 and v5):
+
+| Variable                 | Value                                          |
+|---------------------------|------------------------------------------------|
+| `LEGO_PY_INSTANCE`        | Instance name (e.g. `mysite`)                  |
+| `LEGO_PY_DOMAIN`          | Primary domain (first `-d` in `DOMAINS`)       |
+| `LEGO_PY_CERT_PATH`       | Path to the issued certificate                 |
+| `LEGO_PY_CERT_KEY_PATH`   | Path to the certificate's private key          |
+| `LEGO_PY_CERT_ISSUER_PATH`| Path to the issuer (chain) certificate         |
+
 ## Paths
 
 | Path                          | Purpose                              |
