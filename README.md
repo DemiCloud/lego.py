@@ -1,7 +1,7 @@
 # lego.py
 
-A single-file Python CLI for managing ACME certificates on OpenSUSE MicroOS,
-using the [lego](https://go-acme.github.io/lego/) ACME client under the hood.
+A single-file Python CLI wrapping the [lego](https://go-acme.github.io/lego/)
+ACME client for certificate management on any Linux distro running systemd.
 
 Handles certificate issuance, renewal scheduling via systemd timers, status
 reporting, and configuration management — with no Python dependencies beyond
@@ -14,37 +14,28 @@ the standard library (optional `rich` for prettier output).
 - systemd (for timer-based renewal)
 - Root access for write operations
 
+## Installing lego.py
+
+Fetch the script from the
+[latest GitHub release](https://github.com/DemiCloud/lego.py/releases/latest)
+and drop it somewhere on `PATH`:
+
+```bash
+sudo curl -fsSL -o /usr/local/bin/lego.py \
+  https://github.com/DemiCloud/lego.py/releases/latest/download/lego.py
+sudo chmod +x /usr/local/bin/lego.py
+```
+
+(`releases/latest/download/lego.py` is a permanent GitHub redirect to
+whichever release is newest, so this URL doesn't need updating between
+versions. Swap `latest/download` for `download/vX.Y.Z` to pin a specific
+release instead.)
+
 ## Installing lego
 
-**OpenSUSE MicroOS / Aeon / Kalpa** (requires reboot to apply):
-```bash
-sudo transactional-update pkg install lego
-sudo systemctl reboot
-```
-
-**OpenSUSE Leap / Tumbleweed:**
-```bash
-sudo zypper install lego
-```
-
-**Fedora / RHEL / Rocky / Alma:**
-```bash
-sudo dnf install lego
-```
-
-**Debian / Ubuntu:**
-```bash
-sudo apt install lego
-```
-
-**macOS (Homebrew):**
-```bash
-brew install lego
-```
-
-Or download a pre-built binary from the
-[lego releases page](https://github.com/go-acme/lego/releases) and place it
-somewhere in your `PATH` — or let `lego.py` do it:
+Let `lego.py` fetch and verify it directly from GitHub releases — works the
+same on every distro, and sidesteps outdated or broken distro packages (see
+the known issue below):
 
 ```bash
 # Fetch the latest lego release from GitHub, verified against its published
@@ -61,6 +52,38 @@ sudo lego.py update-lego
 `require_lego()` looks on `PATH` first, then falls back to checking next to
 `lego.py` itself — so this only lands on `PATH` automatically if `lego.py`'s
 own directory is already on `PATH` (e.g. `/usr/local/bin`).
+
+Or install lego through your distro's package manager instead:
+
+**Debian / Ubuntu:**
+```bash
+sudo apt install lego
+```
+
+**Fedora / RHEL / Rocky / Alma:**
+```bash
+sudo dnf install lego
+```
+
+**openSUSE Leap / Tumbleweed:**
+```bash
+sudo zypper install lego
+```
+
+**openSUSE MicroOS / Aeon / Kalpa** (requires reboot to apply):
+```bash
+sudo transactional-update pkg install lego
+sudo systemctl reboot
+```
+
+**macOS (Homebrew):**
+```bash
+brew install lego
+```
+
+Or download a pre-built binary yourself from the
+[lego releases page](https://github.com/go-acme/lego/releases) and place it
+somewhere in your `PATH`.
 
 > **Known issue — Debian/Ubuntu/Proxmox `apt` package:** the distro-packaged
 > `lego` binary (as of 4.9.1-2) is a non-standard build: `lego -v` prints
@@ -171,9 +194,10 @@ when the certificate is within 30 days of expiry.
 
 The systemd unit calls back into `lego.py` for the actual renewal, so it
 re-detects the installed lego version on every run — an unattended lego
-upgrade (e.g. via `transactional-update`) won't leave a stale unit behind.
-`lego.py install` bakes lego.py's own path into the unit, though, so
-re-run it if you move or reinstall lego.py itself to a new location.
+upgrade (e.g. via your package manager's automatic updates) won't leave a
+stale unit behind. `lego.py install` bakes lego.py's own path into the
+unit, though, so re-run it if you move or reinstall lego.py itself to a
+new location.
 
 To trigger an immediate renewal:
 
@@ -187,14 +211,9 @@ journalctl -u acme@mysite.service
 Install `python3-rich` for coloured tables and progress indicators.
 Falls back to plain ASCII tables if not available.
 
-**OpenSUSE MicroOS / Aeon / Kalpa** (requires reboot):
+**Debian / Ubuntu:**
 ```bash
-sudo transactional-update pkg install python3-rich
-```
-
-**OpenSUSE Leap / Tumbleweed:**
-```bash
-sudo zypper install python3-rich
+sudo apt install python3-rich
 ```
 
 **Fedora / RHEL:**
@@ -202,7 +221,12 @@ sudo zypper install python3-rich
 sudo dnf install python3-rich
 ```
 
-**Debian / Ubuntu:**
+**openSUSE Leap / Tumbleweed:**
 ```bash
-sudo apt install python3-rich
+sudo zypper install python3-rich
+```
+
+**openSUSE MicroOS / Aeon / Kalpa** (requires reboot):
+```bash
+sudo transactional-update pkg install python3-rich
 ```
