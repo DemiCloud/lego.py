@@ -6,16 +6,22 @@ import csv
 import dataclasses
 import datetime
 import enum
+import hashlib
 import json
 import logging
 import os
 import pathlib
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import textwrap
 import typing
+import urllib.error
+import urllib.request
 
 __version__ = "0.3.0"
 __prog__ = "lego.py"
@@ -440,17 +446,34 @@ def mask_sensitive(key: str, value: str) -> str:
     return "****" if _SENSITIVE_RE.search(key) else value
 
 
+def _find_lego() -> pathlib.Path | None:
+    """Locate the lego binary: PATH first, then next to lego.py itself.
+
+    The fallback matters because 'install --download-lego' defaults to
+    installing lego right next to lego.py, which only lands on PATH if
+    lego.py's own directory does too.
+    """
+    binary = shutil.which("lego")
+    if binary is not None:
+        return pathlib.Path(binary)
+    sibling = pathlib.Path(__file__).resolve().parent / "lego"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return sibling
+    return None
+
+
 def require_lego() -> pathlib.Path:
     """Return the path to the lego binary, or exit with an install hint."""
-    binary = shutil.which("lego")
+    binary = _find_lego()
     if binary is None:
         print(
             f"error: lego not found in PATH.\n"
-            f"See {WIKI_INSTALL_URL} for installation instructions.",
+            f"See {WIKI_INSTALL_URL} for installation instructions, or run "
+            f"'lego.py install --download-lego' to fetch it automatically.",
             file=sys.stderr,
         )
         sys.exit(1)
-    return pathlib.Path(binary)
+    return binary
 
 
 def require_root() -> None:
@@ -508,6 +531,152 @@ def _resolve_lego_version(
             ACME_CONF,
         )
     return detected
+
+
+# ---------------------------------------------------------------------------
+# Downloading lego from GitHub releases
+# ---------------------------------------------------------------------------
+
+_LEGO_GITHUB_REPO = "go-acme/lego"
+_LEGO_RELEASES_API = f"https://api.github.com/repos/{_LEGO_GITHUB_REPO}/releases/latest"
+_LEGO_RELEASE_DOWNLOAD_BASE = f"https://github.com/{_LEGO_GITHUB_REPO}/releases/download"
+
+# lego's goreleaser matrix covers more OS/arch combos than this, but these
+# are the only ones we've needed so far — extend as required.
+_LEGO_ARCH_MAP: dict[str, str] = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+}
+
+
+def _fetch_latest_lego_tag() -> str:
+    """Return the tag name (e.g. 'v5.4.0') of the latest lego GitHub release."""
+    req = urllib.request.Request(
+        _LEGO_RELEASES_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "lego.py"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    return data["tag_name"]
+
+
+def _lego_release_asset_names(tag: str) -> tuple[str, str]:
+    """Return (tarball_name, checksums_name) for *tag* on this host's platform.
+
+    Raises ValueError if the host OS/arch isn't a supported download target.
+    Note lego's checksums file omits the tag's leading 'v' while the tarball
+    name keeps it — this mismatch is real, not a typo.
+    """
+    system = platform.system().lower()
+    if system != "linux":
+        raise ValueError(
+            f"automatic download only supports Linux — this host reports {platform.system()!r}"
+        )
+    arch = _LEGO_ARCH_MAP.get(platform.machine())
+    if arch is None:
+        raise ValueError(
+            f"automatic download doesn't recognize CPU architecture {platform.machine()!r} "
+            f"— download lego manually from {_LEGO_RELEASE_DOWNLOAD_BASE}"
+        )
+    version = tag.lstrip("v")
+    return f"lego_{tag}_{system}_{arch}.tar.gz", f"lego_{version}_checksums.txt"
+
+
+def _extract_lego_binary(tarball_path: pathlib.Path) -> bytes | None:
+    """Return the contents of the 'lego' binary inside *tarball_path*, or None if absent."""
+    with tarfile.open(tarball_path, "r:gz") as tar:
+        member = next(
+            (
+                m
+                for m in tar.getmembers()
+                if m.isfile() and pathlib.PurePosixPath(m.name).name == "lego"
+            ),
+            None,
+        )
+        if member is None:
+            return None
+        extracted = tar.extractfile(member)
+        return extracted.read() if extracted is not None else None
+
+
+def _download_lego(
+    dest_dir: pathlib.Path, version: str | None, output: Output
+) -> int:
+    """Download, checksum-verify, and install the lego binary from GitHub releases.
+
+    *version* may be a specific release (with or without a leading 'v'), or
+    None for the latest release. Overwrites any existing binary at
+    dest_dir/lego, so this also serves as the update path.
+    """
+    try:
+        if version:
+            tag = f"v{version.lstrip('v')}"
+        else:
+            output.step("checking", f"latest lego release ({_LEGO_GITHUB_REPO})")
+            tag = _fetch_latest_lego_tag()
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError) as exc:
+        log.error("could not determine latest lego version: %s", exc)
+        return 1
+
+    try:
+        tarball_name, checksums_name = _lego_release_asset_names(tag)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 1
+
+    base = f"{_LEGO_RELEASE_DOWNLOAD_BASE}/{tag}"
+    tarball_url = f"{base}/{tarball_name}"
+    checksums_url = f"{base}/{checksums_name}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tarball_path = pathlib.Path(tmp) / tarball_name
+
+        output.step("downloading", tarball_url)
+        try:
+            with urllib.request.urlopen(tarball_url, timeout=120) as resp:
+                tarball_path.write_bytes(resp.read())
+            with urllib.request.urlopen(checksums_url, timeout=30) as resp:
+                checksums_text = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as exc:
+            log.error("download failed: %s", exc)
+            return 1
+
+        expected = next(
+            (
+                parts[0]
+                for line in checksums_text.splitlines()
+                if len(parts := line.split()) == 2 and parts[1] == tarball_name
+            ),
+            None,
+        )
+        if expected is None:
+            log.error("checksum for %s not found in %s", tarball_name, checksums_name)
+            return 1
+
+        actual = hashlib.sha256(tarball_path.read_bytes()).hexdigest()
+        if actual != expected:
+            log.error(
+                "checksum mismatch for %s: expected %s, got %s — aborting install",
+                tarball_name,
+                expected,
+                actual,
+            )
+            return 1
+        output.step("verified", f"sha256 checksum ({tag})")
+
+        binary_data = _extract_lego_binary(tarball_path)
+        if binary_data is None:
+            log.error("'lego' binary not found inside %s", tarball_name)
+            return 1
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / "lego"
+    dest_path.write_bytes(binary_data)
+    dest_path.chmod(0o755)
+    output.step("installed", f"{dest_path} ({tag})")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -929,10 +1098,17 @@ def cmd_install(args: argparse.Namespace, output: Output) -> int:
     # with flags frozen at install time.
     lego_py_path = pathlib.Path(__file__).resolve()
 
-    lego_bin = shutil.which("lego")
+    if args.download_lego is not None:
+        lego_dir = pathlib.Path(args.lego_dir) if args.lego_dir else lego_py_path.parent
+        version = None if args.download_lego == "latest" else args.download_lego
+        if _download_lego(lego_dir, version, output) != 0:
+            return 1
+
+    lego_bin = _find_lego()
     if lego_bin is None:
         output.step("warning", "lego not found in PATH — install it before issuing certificates.")
         output.step("hint", f"See: {WIKI_INSTALL_URL}")
+        output.step("hint", "or re-run with --download-lego to fetch it automatically")
     else:
         version_override = None
         if ACME_CONF.exists():
@@ -940,7 +1116,7 @@ def cmd_install(args: argparse.Namespace, output: Output) -> int:
                 version_override = parse_env_file(ACME_CONF).get("LEGO_VERSION")
             except OSError:
                 pass
-        lego_ver = _resolve_lego_version(pathlib.Path(lego_bin), version_override)
+        lego_ver = _resolve_lego_version(lego_bin, version_override)
         output.step("ok", f"lego {'.'.join(str(x) for x in lego_ver)} detected")
 
     unit_service = _UNIT_SERVICE.format(lego_py=lego_py_path)
@@ -980,6 +1156,18 @@ def cmd_install(args: argparse.Namespace, output: Output) -> int:
 
     output.value("\nInstallation complete.")
     return 0
+
+
+def cmd_update_lego(args: argparse.Namespace, output: Output) -> int:
+    """Download (or re-download) the lego binary from GitHub releases."""
+    require_root()
+
+    lego_dir = (
+        pathlib.Path(args.lego_dir)
+        if args.lego_dir
+        else pathlib.Path(__file__).resolve().parent
+    )
+    return _download_lego(lego_dir, args.version, output)
 
 
 def _load_lego_conf(instance: str) -> tuple[dict[str, str], list[str]] | None:
@@ -1376,13 +1564,60 @@ def build_parser() -> argparse.ArgumentParser:
             and acme@.timer unit templates to /etc/systemd/system/, then runs
             systemctl daemon-reload.
 
-            Requires root. Does not install or manage the lego binary itself.
+            By default does not install or manage the lego binary itself —
+            pass --download-lego to fetch it from GitHub releases instead
+            (verified against lego's published sha256 checksums).
+
+            Requires root.
             See: """
             + WIKI_INSTALL_URL
         ),
         formatter_class=_RawDescFmt,
     )
+    p_install.add_argument(
+        "--download-lego",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="VERSION",
+        help="fetch lego from GitHub releases (latest, or a specific version like 5.4.0)",
+    )
+    p_install.add_argument(
+        "--lego-dir",
+        metavar="DIR",
+        help="directory to install the downloaded lego binary into (default: next to lego.py)",
+    )
     p_install.set_defaults(func=cmd_install)
+
+    # -- update-lego ------------------------------------------------------------
+    p_update_lego = subparsers.add_parser(
+        "update-lego",
+        help="download or update the lego binary from GitHub releases",
+        description=textwrap.dedent(
+            """\
+            Downloads lego from GitHub releases, verifies it against the
+            release's published sha256 checksums, and installs it — replacing
+            any existing binary at the destination. Equivalent to
+            'install --download-lego' but usable on its own, without
+            re-running the rest of 'install'.
+
+            Requires root.
+            """
+        ),
+        formatter_class=_RawDescFmt,
+    )
+    p_update_lego.add_argument(
+        "version",
+        nargs="?",
+        default=None,
+        help="specific lego version to install, e.g. 5.4.0 (default: latest)",
+    )
+    p_update_lego.add_argument(
+        "--lego-dir",
+        metavar="DIR",
+        help="directory to install the lego binary into (default: next to lego.py)",
+    )
+    p_update_lego.set_defaults(func=cmd_update_lego)
 
     # -- issue ----------------------------------------------------------------
     p_issue = subparsers.add_parser(

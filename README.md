@@ -44,7 +44,23 @@ brew install lego
 
 Or download a pre-built binary from the
 [lego releases page](https://github.com/go-acme/lego/releases) and place it
-somewhere in your `PATH`.
+somewhere in your `PATH` — or let `lego.py` do it:
+
+```bash
+# Fetch the latest lego release from GitHub, verified against its published
+# sha256 checksums, installed next to lego.py by default (Linux amd64/arm64 only).
+sudo lego.py install --download-lego
+
+# Pin a specific version, or a different destination directory:
+sudo lego.py install --download-lego 5.4.0 --lego-dir /usr/local/bin
+
+# Update an already-downloaded lego later without re-running the rest of install:
+sudo lego.py update-lego
+```
+
+`require_lego()` looks on `PATH` first, then falls back to checking next to
+`lego.py` itself — so this only lands on `PATH` automatically if `lego.py`'s
+own directory is already on `PATH` (e.g. `/usr/local/bin`).
 
 > **Known issue — Debian/Ubuntu/Proxmox `apt` package:** the distro-packaged
 > `lego` binary (as of 4.9.1-2) is a non-standard build: `lego -v` prints
@@ -53,10 +69,9 @@ somewhere in your `PATH`.
 > even though the provider is supported upstream. This is a known packaging
 > issue, not something `lego.py` can work around — the
 > [lego maintainers recommend](https://github.com/go-acme/lego/discussions/1514)
-> using the upstream binary release or building from source instead. If
-> you're stuck on the distro package for other reasons and detection alone
-> is the problem (not missing DNS providers), set `LEGO_VERSION` — see
-> below — but the missing-provider issue requires switching binaries.
+> using the upstream binary release or building from source instead. Run
+> `sudo lego.py install --download-lego` to fetch a proper upstream build
+> automatically instead of relying on the distro package.
 
 ## Quick Start
 
@@ -87,6 +102,7 @@ lego.py status
 | Command                  | Root | Description                                    |
 |--------------------------|------|------------------------------------------------|
 | `install`                | Yes  | Create dirs, install systemd unit templates    |
+| `update-lego [version]`  | Yes  | Download/update the lego binary from GitHub    |
 | `issue <instance>`       | Yes  | Initial certificate issuance via lego CLI      |
 | `renew <instance>`       | Yes  | Immediately trigger renewal via systemctl      |
 | `status`                 | No   | Show expiry and timer state for all certs      |

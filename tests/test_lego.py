@@ -747,5 +747,53 @@ class TestBuildStatusRows(unittest.TestCase):
         self.assertEqual(styles[0], "dim")
 
 
+# ---------------------------------------------------------------------------
+# _lego_release_asset_names
+# ---------------------------------------------------------------------------
+
+
+class TestLegoReleaseAssetNames(unittest.TestCase):
+    def _names(self, system: str, machine: str, tag: str) -> tuple[str, str]:
+        orig_system, orig_machine = lego.platform.system, lego.platform.machine
+        lego.platform.system = lambda: system
+        lego.platform.machine = lambda: machine
+        try:
+            return lego._lego_release_asset_names(tag)
+        finally:
+            lego.platform.system = orig_system
+            lego.platform.machine = orig_machine
+
+    def test_linux_amd64_tarball_keeps_v_prefix(self):
+        tarball, _ = self._names("Linux", "x86_64", "v5.4.0")
+        self.assertEqual(tarball, "lego_v5.4.0_linux_amd64.tar.gz")
+
+    def test_linux_amd64_checksums_drops_v_prefix(self):
+        # lego's release assets are inconsistent here: the tarball name keeps
+        # the leading 'v', the checksums file name does not.
+        _, checksums = self._names("Linux", "x86_64", "v5.4.0")
+        self.assertEqual(checksums, "lego_5.4.0_checksums.txt")
+
+    def test_linux_arm64(self):
+        tarball, _ = self._names("Linux", "aarch64", "v5.4.0")
+        self.assertEqual(tarball, "lego_v5.4.0_linux_arm64.tar.gz")
+
+    def test_amd64_machine_name_also_accepted(self):
+        tarball, _ = self._names("Linux", "amd64", "v5.4.0")
+        self.assertEqual(tarball, "lego_v5.4.0_linux_amd64.tar.gz")
+
+    def test_non_linux_raises(self):
+        with self.assertRaises(ValueError):
+            self._names("Darwin", "x86_64", "v5.4.0")
+
+    def test_unknown_arch_raises(self):
+        with self.assertRaises(ValueError):
+            self._names("Linux", "riscv64", "v5.4.0")
+
+    def test_tag_without_v_prefix_still_works(self):
+        tarball, checksums = self._names("Linux", "x86_64", "5.4.0")
+        self.assertEqual(tarball, "lego_5.4.0_linux_amd64.tar.gz")
+        self.assertEqual(checksums, "lego_5.4.0_checksums.txt")
+
+
 if __name__ == "__main__":
     unittest.main()

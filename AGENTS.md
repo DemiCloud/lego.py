@@ -138,9 +138,24 @@ Use `require_root()` at the top of those handlers. Read-only commands
 
 ### Lego Detection
 
-`require_lego()` calls `shutil.which("lego")`. If not found it exits
-with a message pointing to the wiki installation page. The script never
-installs lego itself.
+`require_lego()` (via `_find_lego()`) checks `PATH` first, then falls back
+to a `lego` binary sitting next to `lego.py` itself
+(`pathlib.Path(__file__).resolve().parent / "lego"`) — this is where
+`install --download-lego` / `update-lego` put it by default. If neither is
+found it exits with a message pointing to the wiki installation page and
+the `--download-lego` flag.
+
+`_download_lego()` fetches a release tarball directly from
+`github.com/go-acme/lego/releases`, verifies its sha256 against the
+release's own `*_checksums.txt` (lego publishes no GPG signature, so this
+is the realistic integrity baseline — same trust boundary as downloading
+the tarball by hand), extracts just the `lego` binary via `tarfile`
+(searching all members for a file named `lego` rather than assuming a
+fixed path, since we don't control the archive layout), and installs it.
+Supports Linux amd64/arm64 only — `_LEGO_ARCH_MAP` extends this. lego's
+asset naming is inconsistent between the tarball (`lego_v5.4.0_...`, with
+the `v`) and the checksums file (`lego_5.4.0_checksums.txt`, without) —
+`_lego_release_asset_names()` is the one place that has to know this.
 
 lego's CLI syntax changed between v4 and v5 (v5 moved global flags under
 the subcommand, and merged `renew` into `run`). `_lego_version()` parses
@@ -175,6 +190,7 @@ did. `cmd_install()` bakes the *absolute path to lego.py itself*
 | Command              | Root? | Description                                 |
 |----------------------|-------|---------------------------------------------|
 | `install`            | Yes   | Create dirs, install systemd units          |
+| `update-lego [ver]`  | Yes   | Download/update lego binary from GitHub     |
 | `issue <instance>`   | Yes   | Initial cert issuance via lego CLI          |
 | `renew <instance>`   | Yes   | `systemctl start acme@<instance>.service`   |
 | `renew-exec <instance>` (hidden) | Yes | Actual lego invocation; called by the systemd unit, not users |
