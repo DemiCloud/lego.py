@@ -367,24 +367,35 @@ class TestQuoteValue(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _build_lego_issue_cmd
+# _build_lego_run_cmd
 # ---------------------------------------------------------------------------
 
 
-class TestBuildLegoIssueCmd(unittest.TestCase):
+class TestBuildLegoRunCmdV4(unittest.TestCase):
+    """v4: global flags before the subcommand; 'run' vs 'renew' as distinct actions."""
+
     _LEGO = pathlib.Path("/usr/bin/lego")
+    _VER = (4, 9, 1)
     _BASE_CONF = {
         "LEGO_EMAIL": "admin@example.com",
         "LEGO_DNS": "cloudflare",
     }
     _DOMAINS = ["foo.example.com", "bar.example.com"]
 
-    def _cmd(self, conf: dict | None = None, domains: list | None = None, hook: str = "") -> list[str]:
-        return lego._build_lego_issue_cmd(
+    def _cmd(
+        self,
+        conf: dict | None = None,
+        domains: list | None = None,
+        hook: str = "",
+        action: str = "issue",
+    ) -> list[str]:
+        return lego._build_lego_run_cmd(
             self._LEGO,
             conf if conf is not None else self._BASE_CONF,
             domains if domains is not None else self._DOMAINS,
             hook,
+            self._VER,
+            action,
         )
 
     def test_accept_tos_present(self):
@@ -413,12 +424,24 @@ class TestBuildLegoIssueCmd(unittest.TestCase):
         idx = cmd.index("--dns")
         self.assertEqual(cmd[idx + 1], "cloudflare")
 
-    def test_run_appended(self):
-        self.assertIn("run", self._cmd())
+    def test_issue_appends_run(self):
+        cmd = self._cmd(action="issue")
+        self.assertIn("run", cmd)
+        self.assertNotIn("renew", cmd)
 
-    def test_run_after_dns(self):
-        cmd = self._cmd()
+    def test_renew_appends_renew(self):
+        cmd = self._cmd(action="renew")
+        self.assertIn("renew", cmd)
+        self.assertNotIn("run", cmd)
+
+    def test_subcommand_after_dns(self):
+        cmd = self._cmd(action="issue")
         self.assertGreater(cmd.index("run"), cmd.index("--dns"))
+
+    def test_accept_tos_before_subcommand(self):
+        # v4: global flags come before the trailing action subcommand.
+        cmd = self._cmd(action="issue")
+        self.assertLess(cmd.index("--accept-tos"), cmd.index("run"))
 
     def test_server_absent_when_not_set(self):
         self.assertNotIn("--server", self._cmd())
@@ -464,6 +487,14 @@ class TestBuildLegoIssueCmd(unittest.TestCase):
     def test_pfx_flags_absent_when_disabled(self):
         self.assertNotIn("--pfx", self._cmd())
 
+    def test_dns_resolvers_present(self):
+        conf = {**self._BASE_CONF, "LEGO_DNS_RESOLVERS": "1.1.1.1:53,8.8.8.8:53"}
+        cmd = self._cmd(conf=conf)
+        resolvers = [
+            cmd[i + 1] for i in range(len(cmd) - 1) if cmd[i] == "--dns.resolvers"
+        ]
+        self.assertEqual(resolvers, ["1.1.1.1:53", "8.8.8.8:53"])
+
     def test_hook_added_when_present(self):
         cmd = self._cmd(hook="systemctl restart nginx")
         self.assertIn("--run-hook", cmd)
@@ -473,9 +504,120 @@ class TestBuildLegoIssueCmd(unittest.TestCase):
     def test_hook_absent_when_empty(self):
         self.assertNotIn("--run-hook", self._cmd(hook=""))
 
-    def test_hook_after_run(self):
-        cmd = self._cmd(hook="systemctl restart nginx")
+    def test_hook_after_subcommand(self):
+        cmd = self._cmd(hook="systemctl restart nginx", action="issue")
         self.assertGreater(cmd.index("--run-hook"), cmd.index("run"))
+
+    def test_renew_hook_uses_run_hook_flag(self):
+        # v4's 'renew' subcommand uses the same --run-hook flag name as 'run'.
+        cmd = self._cmd(hook="systemctl restart nginx", action="renew")
+        self.assertIn("--run-hook", cmd)
+        self.assertGreater(cmd.index("--run-hook"), cmd.index("renew"))
+
+
+class TestBuildLegoRunCmdV5(unittest.TestCase):
+    """v5: flags after the subcommand; 'renew' no longer exists — always 'run'."""
+
+    _LEGO = pathlib.Path("/usr/bin/lego")
+    _VER = (5, 4, 0)
+    _BASE_CONF = {
+        "LEGO_EMAIL": "admin@example.com",
+        "LEGO_DNS": "cloudflare",
+    }
+    _DOMAINS = ["foo.example.com"]
+
+    def _cmd(self, hook: str = "", action: str = "issue") -> list[str]:
+        return lego._build_lego_run_cmd(
+            self._LEGO, self._BASE_CONF, self._DOMAINS, hook, self._VER, action
+        )
+
+    def test_run_is_second_token_for_issue(self):
+        cmd = self._cmd(action="issue")
+        self.assertEqual(cmd[1], "run")
+
+    def test_run_is_second_token_for_renew_too(self):
+        # v5 has no separate 'renew' command — renewal also uses 'run'.
+        cmd = self._cmd(action="renew")
+        self.assertEqual(cmd[1], "run")
+        self.assertNotIn("renew", cmd)
+
+    def test_accept_tos_after_subcommand(self):
+        cmd = self._cmd()
+        self.assertGreater(cmd.index("--accept-tos"), cmd.index("run"))
+
+    def test_eab_uses_dotted_flags(self):
+        conf = {
+            **self._BASE_CONF,
+            "LEGO_EAB": "true",
+            "LEGO_EAB_KID": "mykid",
+            "LEGO_EAB_HMAC": "myhmac",
+        }
+        cmd = lego._build_lego_run_cmd(
+            self._LEGO, conf, self._DOMAINS, "", self._VER, "issue"
+        )
+        self.assertIn("--eab.kid", cmd)
+        self.assertIn("--eab.hmac", cmd)
+        self.assertNotIn("--kid", cmd)
+        self.assertNotIn("--hmac", cmd)
+
+    def test_hook_uses_deploy_hook_flag(self):
+        cmd = self._cmd(hook="systemctl restart nginx", action="renew")
+        self.assertIn("--deploy-hook", cmd)
+        self.assertNotIn("--run-hook", cmd)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_lego_version
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLegoVersion(unittest.TestCase):
+    # A path that can't be exec'd — _lego_version() catches FileNotFoundError
+    # and returns (0, 0, 0), letting us exercise the fallback without mocking.
+    _MISSING_LEGO = pathlib.Path("/nonexistent/lego")
+
+    def test_override_major_4(self):
+        self.assertEqual(lego._resolve_lego_version(self._MISSING_LEGO, "4"), (4, 0, 0))
+
+    def test_override_major_5(self):
+        self.assertEqual(lego._resolve_lego_version(self._MISSING_LEGO, "5"), (5, 0, 0))
+
+    def test_override_auto_falls_back_to_detection(self):
+        self.assertEqual(
+            lego._resolve_lego_version(self._MISSING_LEGO, "auto"), (0, 0, 0)
+        )
+
+    def test_no_override_falls_back_to_detection(self):
+        self.assertEqual(lego._resolve_lego_version(self._MISSING_LEGO, None), (0, 0, 0))
+
+    def test_invalid_override_falls_back_to_detection(self):
+        self.assertEqual(
+            lego._resolve_lego_version(self._MISSING_LEGO, "not-a-version"), (0, 0, 0)
+        )
+
+
+# ---------------------------------------------------------------------------
+# LEGO_VERSION config schema
+# ---------------------------------------------------------------------------
+
+
+class TestValidateLegoVersion(unittest.TestCase):
+    def test_auto_valid(self):
+        self.assertIsNone(lego._validate_lego_version("auto"))
+
+    def test_four_valid(self):
+        self.assertIsNone(lego._validate_lego_version("4"))
+
+    def test_five_valid(self):
+        self.assertIsNone(lego._validate_lego_version("5"))
+
+    def test_other_invalid(self):
+        self.assertIsNotNone(lego._validate_lego_version("6"))
+
+    def test_resolves_by_alias(self):
+        entry = lego._resolve_config_key("lego-version")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.key, "LEGO_VERSION")
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,18 @@ Or download a pre-built binary from the
 [lego releases page](https://github.com/go-acme/lego/releases) and place it
 somewhere in your `PATH`.
 
+> **Known issue — Debian/Ubuntu/Proxmox `apt` package:** the distro-packaged
+> `lego` binary (as of 4.9.1-2) is a non-standard build: `lego -v` prints
+> `lego version dev` with no parseable version, and it's often missing most
+> DNS providers entirely (e.g. `unrecognized DNS provider: cloudflare`),
+> even though the provider is supported upstream. This is a known packaging
+> issue, not something `lego.py` can work around — the
+> [lego maintainers recommend](https://github.com/go-acme/lego/discussions/1514)
+> using the upstream binary release or building from source instead. If
+> you're stuck on the distro package for other reasons and detection alone
+> is the problem (not missing DNS providers), set `LEGO_VERSION` — see
+> below — but the missing-provider issue requires switching binaries.
+
 ## Quick Start
 
 ```bash
@@ -101,6 +113,7 @@ Created by `lego.py install`. Known keys (use the alias with `config set`):
 | `server`        | `LEGO_SERVER`        | ACME directory URL                       |
 | `email`         | `LEGO_EMAIL`         | Account email address                    |
 | `dns`           | `LEGO_DNS`           | lego DNS provider name                   |
+| `lego-version`  | `LEGO_VERSION`       | Override lego version detection: auto, 4, or 5 |
 | `dns-resolvers` | `LEGO_DNS_RESOLVERS` | Resolver(s) for DNS-01 (host:port)       |
 | `eab`           | `LEGO_EAB`           | Enable External Account Binding          |
 | `eab-kid`       | `LEGO_EAB_KID`       | EAB key ID                               |
@@ -139,6 +152,12 @@ HOOK="/path/to/deploy-hook.sh"   # optional; runs after successful renewal
 `lego.py issue` enables `acme@<instance>.timer` automatically after issuance.
 The timer fires daily at 03:35 with a 1-hour random delay. lego renews only
 when the certificate is within 30 days of expiry.
+
+The systemd unit calls back into `lego.py` for the actual renewal, so it
+re-detects the installed lego version on every run — an unattended lego
+upgrade (e.g. via `transactional-update`) won't leave a stale unit behind.
+`lego.py install` bakes lego.py's own path into the unit, though, so
+re-run it if you move or reinstall lego.py itself to a new location.
 
 To trigger an immediate renewal:
 

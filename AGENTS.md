@@ -142,6 +142,34 @@ Use `require_root()` at the top of those handlers. Read-only commands
 with a message pointing to the wiki installation page. The script never
 installs lego itself.
 
+lego's CLI syntax changed between v4 and v5 (v5 moved global flags under
+the subcommand, and merged `renew` into `run`). `_lego_version()` parses
+`lego --version`; some distro packages (e.g. Debian) print an unversioned
+`lego version dev` that can't be parsed, in which case it returns
+`(0, 0, 0)`. `_resolve_lego_version()` wraps this with an optional
+`LEGO_VERSION` override from `acme.conf` (`auto`/`4`/`5`) and warns to
+stderr whenever detection fails and it has to silently assume v4 syntax.
+`_build_lego_run_cmd(action="issue"|"renew")` is the single place that
+turns a version + action into the actual `lego` argv — v5 always uses
+`run` regardless of action, since v5 dropped `renew` as a separate command.
+
+### Renewal Execution
+
+Critically, **version detection happens at execution time, not at
+`install` time.** The systemd unit's `ExecStart` calls back into
+`lego.py renew-exec <instance>` (a hidden subcommand — no `help=` on its
+subparser, so it doesn't show in `--help`, but it's not otherwise special)
+rather than invoking `lego` directly with flags baked into the unit file.
+This matters because lego can be upgraded out from under an already-
+installed unit (e.g. MicroOS's `transactional-update` bumping v4→v5 on
+reboot) — freezing version-specific flags into the unit at install time
+means the unit silently goes stale on the next lego upgrade. Routing
+through `lego.py` means every timer-triggered renewal re-detects the
+version and rebuilds the command from scratch, same as `issue` already
+did. `cmd_install()` bakes the *absolute path to lego.py itself*
+(`pathlib.Path(__file__).resolve()`) into `ExecStart` — re-run
+`lego.py install` if you move or reinstall lego.py to a new location.
+
 ## Subcommands
 
 | Command              | Root? | Description                                 |
@@ -149,6 +177,7 @@ installs lego itself.
 | `install`            | Yes   | Create dirs, install systemd units          |
 | `issue <instance>`   | Yes   | Initial cert issuance via lego CLI          |
 | `renew <instance>`   | Yes   | `systemctl start acme@<instance>.service`   |
+| `renew-exec <instance>` (hidden) | Yes | Actual lego invocation; called by the systemd unit, not users |
 | `status`             | No    | Cert expiry table across all instances      |
 | `config show`        | No    | Display acme.conf (secrets masked)          |
 | `config get <key>`   | No    | Print a single config value                 |
