@@ -5,10 +5,10 @@ Developer and AI-agent reference for `lego.py`.
 ## Project Overview
 
 `lego.py` is a single-file Python CLI for managing ACME certificates on
-OpenSUSE MicroOS using the [lego](https://go-acme.github.io/lego/) CLI as
-the underlying ACME client. It handles certificate issuance, renewal
-triggering, status reporting, and configuration management of the
-surrounding systemd units and config files.
+any Linux distro running systemd, using the
+[lego](https://go-acme.github.io/lego/) CLI as the underlying ACME client.
+It handles certificate issuance, renewal triggering, status reporting, and
+configuration management of the surrounding systemd units and config files.
 
 ## Repository Layout
 
@@ -53,11 +53,8 @@ file in `systemd/`**. The script requires no external files at runtime.
 `rich` is JIT-detected at startup via a `try/except ImportError`. If
 absent the script falls back to `PlainOutput` automatically. **Never add
 a `requirements.txt` or `pyproject.toml`** — there is no venv, no pip
-install step. On MicroOS, `python3-rich` can be installed via:
-
-```
-transactional-update pkg install python3-rich
-```
+install step. Install it via the distro's package manager instead — see
+the README for per-distro commands.
 
 ## Architecture
 
@@ -176,8 +173,9 @@ Critically, **version detection happens at execution time, not at
 subparser, so it doesn't show in `--help`, but it's not otherwise special)
 rather than invoking `lego` directly with flags baked into the unit file.
 This matters because lego can be upgraded out from under an already-
-installed unit (e.g. MicroOS's `transactional-update` bumping v4→v5 on
-reboot) — freezing version-specific flags into the unit at install time
+installed unit by an unattended package upgrade (the bug report that
+motivated this: MicroOS's `transactional-update` bumping v4→v5 on reboot)
+— freezing version-specific flags into the unit at install time
 means the unit silently goes stale on the next lego upgrade. Routing
 through `lego.py` means every timer-triggered renewal re-detects the
 version and rebuilds the command from scratch, same as `issue` already
