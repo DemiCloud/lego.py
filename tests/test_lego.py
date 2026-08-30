@@ -567,6 +567,34 @@ class TestBuildLegoRunCmdV5(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _hook_env
+# ---------------------------------------------------------------------------
+
+
+class TestHookEnv(unittest.TestCase):
+    def test_uses_primary_domain(self):
+        env = lego._hook_env("mysite", ["foo.example.com", "bar.example.com"])
+        self.assertEqual(env["LEGO_PY_DOMAIN"], "foo.example.com")
+
+    def test_instance_passed_through(self):
+        env = lego._hook_env("mysite", ["foo.example.com"])
+        self.assertEqual(env["LEGO_PY_INSTANCE"], "mysite")
+
+    def test_cert_paths_under_cert_dir(self):
+        env = lego._hook_env("mysite", ["foo.example.com"])
+        self.assertEqual(
+            env["LEGO_PY_CERT_PATH"], str(lego.CERT_DIR / "foo.example.com.crt")
+        )
+        self.assertEqual(
+            env["LEGO_PY_CERT_KEY_PATH"], str(lego.CERT_DIR / "foo.example.com.key")
+        )
+        self.assertEqual(
+            env["LEGO_PY_CERT_ISSUER_PATH"],
+            str(lego.CERT_DIR / "foo.example.com.issuer.crt"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # _resolve_lego_version
 # ---------------------------------------------------------------------------
 

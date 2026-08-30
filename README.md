@@ -128,6 +128,7 @@ lego.py status
 | `update-lego [version]`  | Yes  | Download/update the lego binary from GitHub    |
 | `issue <instance>`       | Yes  | Initial certificate issuance via lego CLI      |
 | `renew <instance>`       | Yes  | Immediately trigger renewal via systemctl      |
+| `hook <instance>`        | Yes  | Manually run the instance's configured HOOK    |
 | `status`                 | No   | Show expiry and timer state for all certs      |
 | `config show`            | No   | Display acme.conf with secrets masked          |
 | `config get <key>`       | No   | Print a single config value                    |
@@ -187,6 +188,10 @@ on lego's own hook variables, which were renamed between v4 and v5):
 | `LEGO_PY_CERT_PATH`       | Path to the issued certificate                 |
 | `LEGO_PY_CERT_KEY_PATH`   | Path to the certificate's private key          |
 | `LEGO_PY_CERT_ISSUER_PATH`| Path to the issuer (chain) certificate         |
+
+Use `lego.py hook <instance>` to run the configured hook on demand against
+the instance's current certificate — useful for testing a hook script
+without waiting for (or forcing) an actual renewal.
 
 ## Paths
 

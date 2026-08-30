@@ -192,6 +192,7 @@ did. `cmd_install()` bakes the *absolute path to lego.py itself*
 | `issue <instance>`   | Yes   | Initial cert issuance via lego CLI          |
 | `renew <instance>`   | Yes   | `systemctl start acme@<instance>.service`   |
 | `renew-exec <instance>` (hidden) | Yes | Actual lego invocation; called by the systemd unit, not users |
+| `hook <instance>`    | Yes   | Manually run the instance's HOOK against its current cert |
 | `status`             | No    | Cert expiry table across all instances      |
 | `config show`        | No    | Display acme.conf (secrets masked)          |
 | `config get <key>`   | No    | Print a single config value                 |

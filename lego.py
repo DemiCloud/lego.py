@@ -1220,6 +1220,24 @@ def _load_lego_conf(instance: str) -> tuple[dict[str, str], list[str]] | None:
     return conf, domains
 
 
+def _hook_env(instance: str, domains: list[str]) -> dict[str, str]:
+    """Stable, version-independent vars to expose to the user's HOOK script.
+
+    lego itself renamed its hook vars between v4 (LEGO_CERT_PATH) and v5
+    (LEGO_HOOK_CERT_PATH) — computing these ourselves from CERT_DIR, which
+    this tool already controls via --path, means hook scripts never need to
+    track lego's internal naming across future version bumps either.
+    """
+    primary = domains[0]
+    return {
+        "LEGO_PY_INSTANCE": instance,
+        "LEGO_PY_DOMAIN": primary,
+        "LEGO_PY_CERT_PATH": str(CERT_DIR / f"{primary}.crt"),
+        "LEGO_PY_CERT_KEY_PATH": str(CERT_DIR / f"{primary}.key"),
+        "LEGO_PY_CERT_ISSUER_PATH": str(CERT_DIR / f"{primary}.issuer.crt"),
+    }
+
+
 def _run_lego(
     lego: pathlib.Path,
     instance: str,
@@ -1235,18 +1253,7 @@ def _run_lego(
     # Merge config into subprocess env so provider credentials are available.
     env = os.environ.copy()
     env.update(conf)
-
-    # Stable, version-independent vars for the user's HOOK script. lego itself
-    # renamed its hook vars between v4 (LEGO_CERT_PATH) and v5
-    # (LEGO_HOOK_CERT_PATH) — computing these ourselves from CERT_DIR, which
-    # this tool already controls via --path, means hook scripts never need to
-    # track lego's internal naming across future version bumps either.
-    primary = domains[0]
-    env["LEGO_PY_INSTANCE"] = instance
-    env["LEGO_PY_DOMAIN"] = primary
-    env["LEGO_PY_CERT_PATH"] = str(CERT_DIR / f"{primary}.crt")
-    env["LEGO_PY_CERT_KEY_PATH"] = str(CERT_DIR / f"{primary}.key")
-    env["LEGO_PY_CERT_ISSUER_PATH"] = str(CERT_DIR / f"{primary}.issuer.crt")
+    env.update(_hook_env(instance, domains))
 
     try:
         subprocess.run(cmd, check=True, env=env)
@@ -1340,6 +1347,49 @@ def cmd_renew(args: argparse.Namespace, output: Output) -> int:
         return 1
 
     output.step("ok", f"Renewal triggered. Check logs with: journalctl -u {service}")
+    return 0
+
+
+def cmd_hook(args: argparse.Namespace, output: Output) -> int:
+    """Manually run an instance's configured HOOK against its current certificate."""
+    require_root()
+
+    instance = args.instance
+    loaded = _load_lego_conf(instance)
+    if loaded is None:
+        return 1
+    conf, domains = loaded
+
+    hook = conf.get("HOOK", "")
+    if not hook:
+        log.error(
+            "no HOOK configured for instance %r — set it in %s",
+            instance,
+            ACME_DIR / f"{instance}.env",
+        )
+        return 1
+
+    cert_file = CERT_DIR / f"{domains[0]}.crt"
+    if not cert_file.exists():
+        log.error(
+            "no certificate found at %s — run 'lego.py issue %s' first",
+            cert_file,
+            instance,
+        )
+        return 1
+
+    env = os.environ.copy()
+    env.update(conf)
+    env.update(_hook_env(instance, domains))
+
+    log.info("running hook for instance %r...", instance)
+    try:
+        subprocess.run(hook, shell=True, check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        log.error("hook failed (exit %d)", exc.returncode)
+        return 1
+
+    output.value("Done. Hook ran successfully.")
     return 0
 
 
@@ -1684,6 +1734,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_renew_exec.add_argument("instance", help="certificate instance name")
     p_renew_exec.set_defaults(func=cmd_renew_exec)
+
+    # -- hook -------------------------------------------------------------------
+    p_hook = subparsers.add_parser(
+        "hook",
+        help="manually run an instance's configured deploy hook",
+        description=textwrap.dedent(
+            """\
+            Runs the HOOK command configured for <instance> against its current
+            certificate, with the same LEGO_PY_* environment variables set that
+            'issue'/'renew-exec' pass to it. Useful for testing a hook script
+            without waiting for (or forcing) an actual renewal.
+
+            Requires root and an already-issued certificate.
+            """
+        ),
+        formatter_class=_RawDescFmt,
+    )
+    p_hook.add_argument("instance", help="certificate instance name")
+    p_hook.set_defaults(func=cmd_hook)
 
     # -- status ---------------------------------------------------------------
     p_status = subparsers.add_parser(
