@@ -226,3 +226,59 @@ did. `cmd_install()` bakes the *absolute path to lego.py itself*
   double-quote values in config files.
 - `transactional-update` on MicroOS requires a reboot to take effect;
   `install` should warn the user if it detects a pending reboot.
+
+## Release Process
+
+Only commit or tag when explicitly asked, same as any other repo. When
+asked to "cut a release":
+
+1. **Bump `__version__` in lego.py.** Pre-1.0, treat any user-visible
+   change — bug fix or new feature — as its own minor version bump (no
+   patch-level increments used so far: `0.2.0` → `0.3.0` renewal fix →
+   `0.4.0` download feature). If the version-bump lands with other
+   changes already committed, give it its own small commit.
+2. **Prefer one commit per logically distinct change**, even when they're
+   implemented in the same session (e.g. a bug fix and an unrelated new
+   feature) — don't squash unrelated work into one commit for
+   convenience. Each commit should independently pass the test suite;
+   verify before moving to the next one, not just at the end.
+3. **Tag annotated, not lightweight**: `git tag -a vX.Y.Z -m "<bullet
+   summary of changes>"`.
+4. **A git tag alone is not a GitHub Release** — it won't show up on the
+   repo's Releases page. Also run
+   `gh release create vX.Y.Z --title vX.Y.Z --notes "..."`.
+5. **Attach `lego.py` itself as a release asset**:
+   `gh release upload vX.Y.Z lego.py`. Pull the exact tagged content
+   first (`git show vX.Y.Z:lego.py > /path/to/lego.py`) rather than
+   assuming the working tree still matches the tag, and diff the two
+   before uploading. This matters because GitHub's auto-generated
+   "Source code" archive is the *whole repo* (tests/, AGENTS.md,
+   systemd/, ...) — not something to ever point users at. The correct
+   one-liner for users is the standalone asset via the stable
+   `github.com/<owner>/<repo>/releases/latest/download/lego.py` redirect
+   (documented in the README's "Installing lego.py" section), which
+   keeps working release over release without edits as long as every
+   release attaches an asset literally named `lego.py`.
+6. **Never `git push`** (commits or tags) unless explicitly asked, even
+   after cutting a release — leave it to the user. Note: this sandboxed
+   environment may not have working SSH credentials for the git remote
+   (`git push` can fail with "Permission denied (publickey)") even
+   though `gh` works fine (separate HTTPS token auth) for release/API
+   calls — that's an environment limitation, not a real error to
+   troubleshoot. Just hand the user the exact `git push` commands to run
+   themselves from a session that has their key.
+7. **Moving an already-pushed tag requires a force-push** — confirm with
+   the user before doing this (e.g. "fold a follow-up docs commit into
+   the existing release") rather than assuming; a new patch release is
+   the lower-risk alternative and worth offering explicitly.
+
+## Documentation Conventions
+
+lego.py depends only on Python 3.11+ and systemd — nothing distro
+specific. README/AGENTS.md framing (titles, intros, example ordering)
+should reflect that and not center any one distro (this project used to
+lead with OpenSUSE MicroOS; that's been genericized). Concrete,
+factual per-distro notes are still fine and worth keeping — e.g. the
+Debian/Ubuntu/Proxmox apt package's known issues, or MicroOS's
+transactional-update reboot requirement — those are real technical
+caveats, not framing bias.
