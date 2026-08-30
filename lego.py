@@ -23,7 +23,7 @@ import typing
 import urllib.error
 import urllib.request
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __prog__ = "lego.py"
 __description__ = "ACME certificate management using the lego CLI"
 
