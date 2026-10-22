@@ -785,13 +785,63 @@ def _parse_lego_list(raw: str) -> dict[str, _LegoCert]:
     return certs
 
 
+def _parse_lego_list_json(raw: str) -> dict[str, _LegoCert]:
+    """Parse the JSON output of ``lego certificates list`` into certs."""
+    try:
+        records = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON from lego certificates list: {exc}") from exc
+
+    if records is None:
+        return {}
+    if not isinstance(records, list):
+        raise ValueError("expected a JSON array from lego certificates list")
+
+    certs: dict[str, _LegoCert] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("expected certificate objects in lego JSON output")
+        name = record.get("name")
+        domains = record.get("domains", [])
+        expiry_str = record.get("expirationDate")
+        cert_path = record.get("path")
+        if (
+            not isinstance(name, str)
+            or not isinstance(domains, list)
+            or not all(isinstance(domain, str) for domain in domains)
+            or not isinstance(expiry_str, str)
+            or not isinstance(cert_path, str)
+        ):
+            raise ValueError("lego JSON output contains an incomplete certificate")
+        try:
+            expiry = _parse_lego_expiry(expiry_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"could not parse expiry {expiry_str!r} for cert {name}"
+            ) from exc
+        certs[name] = _LegoCert(
+            name=name,
+            domains=domains or [name],
+            expiry=expiry,
+            cert_path=pathlib.Path(cert_path),
+        )
+    return certs
+
+
 def _run_lego_list(
     lego: pathlib.Path,
     lego_ver: tuple[int, int, int],
-) -> dict[str, _LegoCert]:
+) -> dict[str, _LegoCert] | None:
     """Run ``lego [certificates] list`` and return parsed results."""
     if lego_ver >= (5, 0, 0):
-        list_cmd = [str(lego), "certificates", "list", "--path", str(ACME_WORK_DIR)]
+        list_cmd = [
+            str(lego),
+            "certificates",
+            "list",
+            "--path",
+            str(ACME_WORK_DIR),
+            "--json",
+        ]
     else:
         list_cmd = [str(lego), "--path", str(ACME_WORK_DIR), "list"]
     try:
@@ -801,18 +851,24 @@ def _run_lego_list(
             text=True,
         )
     except FileNotFoundError:
-        log.warning("lego binary not found at %s", lego)
-        return {}
+        log.error("lego binary not found at %s", lego)
+        return None
 
     if result.returncode != 0:
-        log.warning(
+        log.error(
             "lego list failed (exit %d): %s",
             result.returncode,
             result.stderr.strip(),
         )
-        return {}
+        return None
 
-    return _parse_lego_list(result.stdout)
+    try:
+        if lego_ver >= (5, 0, 0):
+            return _parse_lego_list_json(result.stdout)
+        return _parse_lego_list(result.stdout)
+    except ValueError as exc:
+        log.error("could not read lego certificate list: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1347,17 +1403,63 @@ def _sanitize_host(server: str) -> str:
     return re.sub(r"[:/\\]", "_", host)
 
 
-def _account_key_path(conf: dict[str, str]) -> pathlib.Path:
+def _account_key_path(
+    conf: dict[str, str],
+    lego_ver: tuple[int, int, int] = (5, 0, 0),
+) -> pathlib.Path:
     """Compute the account private key path lego itself manages under ACME_WORK_DIR.
 
-    lego lays out account data as
+    lego v5 lays out account data as
     ``<path>/accounts/<sanitized-server-host>/<account-id>/<account-id>.key``.
+    v4 places that key under an additional ``keys`` directory.
     lego.py never passes an explicit account ID, so the effective account ID
     is always the account email (lego falls back to it when none is given).
     """
     server = conf.get("LEGO_SERVER") or _LEGO_DEFAULT_SERVER
     email = conf["LEGO_EMAIL"]
-    return ACME_WORK_DIR / "accounts" / _sanitize_host(server) / email / f"{email}.key"
+    account_dir = ACME_WORK_DIR / "accounts" / _sanitize_host(server) / email
+    if lego_ver < (5, 0, 0):
+        account_dir /= "keys"
+    return account_dir / f"{email}.key"
+
+
+def _has_legacy_lego_storage() -> bool:
+    """Return whether ACME_WORK_DIR contains lego v4 account or cert data."""
+    accounts_dir = ACME_WORK_DIR / "accounts"
+    if accounts_dir.is_dir() and any(
+        path.is_dir() for path in accounts_dir.rglob("keys")
+    ):
+        return True
+
+    certificates_dir = ACME_WORK_DIR / "certificates"
+    if certificates_dir.is_dir():
+        for resource_path in certificates_dir.rglob("*.json"):
+            try:
+                resource = json.loads(resource_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(resource, dict)
+                and "domain" in resource
+                and "id" not in resource
+            ):
+                return True
+    return False
+
+
+def _check_lego_v5_storage(lego_ver: tuple[int, int, int]) -> bool:
+    """Prevent v5 from using v4 data before lego's explicit storage migration."""
+    if lego_ver < (5, 0, 0) or not _has_legacy_lego_storage():
+        return True
+
+    log.error(
+        "lego v5 requires migration of existing data in %s; back it up, then "
+        "run 'lego migrate --path %s' and confirm the migration before "
+        "issuing or renewing certificates",
+        ACME_WORK_DIR,
+        ACME_WORK_DIR,
+    )
+    return False
 
 
 def _account_file_path(conf: dict[str, str]) -> pathlib.Path:
@@ -1384,7 +1486,11 @@ def _read_account_url(conf: dict[str, str]) -> str | None:
     return (data.get("registration") or {}).get("accountURL") or None
 
 
-def _sync_account_key(conf: dict[str, str], output: Output) -> int:
+def _sync_account_key(
+    conf: dict[str, str],
+    output: Output,
+    lego_ver: tuple[int, int, int] = (5, 0, 0),
+) -> int:
     """Relocate the ACME account private key to LEGO_ACCOUNT_KEY_PATH, if configured.
 
     lego has no native flag to store just the account key somewhere other
@@ -1396,7 +1502,7 @@ def _sync_account_key(conf: dict[str, str], output: Output) -> int:
     symlink is already in place.
     """
     target = pathlib.Path(conf["LEGO_ACCOUNT_KEY_PATH"])
-    internal = _account_key_path(conf)
+    internal = _account_key_path(conf, lego_ver)
 
     try:
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1468,6 +1574,8 @@ def _run_lego(
 ) -> int:
     """Detect the lego version, build the command, and run it. Returns the exit status."""
     lego_ver = _resolve_lego_version(lego, conf.get("LEGO_VERSION"))
+    if not _check_lego_v5_storage(lego_ver):
+        return 1
 
     challenge = (conf.get("LEGO_CHALLENGE") or "").lower()
     if challenge == "dns-persist-01" and lego_ver < (5, 0, 0):
@@ -1478,7 +1586,7 @@ def _run_lego(
         return 1
 
     if conf.get("LEGO_ACCOUNT_KEY_PATH"):
-        if _sync_account_key(conf, output) != 0:
+        if _sync_account_key(conf, output, lego_ver) != 0:
             return 1
 
     cmd = _build_lego_run_cmd(lego, conf, domains, conf.get("HOOK", ""), lego_ver, action)
@@ -1668,8 +1776,11 @@ def cmd_account_register(args: argparse.Namespace, output: Output) -> int:
         )
         return 1
 
+    if not _check_lego_v5_storage(lego_ver):
+        return 1
+
     if conf.get("LEGO_ACCOUNT_KEY_PATH"):
-        if _sync_account_key(conf, output) != 0:
+        if _sync_account_key(conf, output, lego_ver) != 0:
             return 1
 
     cmd = [
@@ -1724,6 +1835,8 @@ def cmd_status(args: argparse.Namespace, output: Output) -> int:
     lego_ver = _resolve_lego_version(lego, version_override)
 
     issued = _run_lego_list(lego, lego_ver)
+    if issued is None:
+        return 1
     instances = load_instance_configs()
 
     if not issued and not instances:

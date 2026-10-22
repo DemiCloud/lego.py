@@ -244,6 +244,64 @@ class TestParseLegoCertList(unittest.TestCase):
         self.assertEqual(result, {})
 
 
+class TestParseLegoCertListJson(unittest.TestCase):
+    _CERT = {
+        "name": "foo.example.com",
+        "domains": ["foo.example.com", "bar.example.com"],
+        "expirationDate": "2026-06-06 23:59:59 +0000 UTC",
+        "expired": False,
+        "path": "/var/lib/acme/certificates/foo.example.com.crt",
+    }
+
+    def test_certificate_fields_parsed(self):
+        result = lego._parse_lego_list_json(json.dumps([self._CERT]))
+        cert = result["foo.example.com"]
+        self.assertEqual(cert.domains, ["foo.example.com", "bar.example.com"])
+        self.assertEqual(cert.expiry.year, 2026)
+        self.assertEqual(
+            cert.cert_path,
+            pathlib.Path("/var/lib/acme/certificates/foo.example.com.crt"),
+        )
+
+    def test_null_output_means_no_certificates(self):
+        self.assertEqual(lego._parse_lego_list_json("null"), {})
+
+    def test_invalid_output_raises(self):
+        with self.assertRaises(ValueError):
+            lego._parse_lego_list_json('{"name": "not-an-array"}')
+
+    def test_incomplete_certificate_raises(self):
+        with self.assertRaises(ValueError):
+            lego._parse_lego_list_json(json.dumps([{"name": "foo.example.com"}]))
+
+
+class TestRunLegoList(unittest.TestCase):
+    def test_v5_uses_json_command(self):
+        result = mock.Mock(returncode=0, stdout="[]", stderr="")
+        with mock.patch.object(lego.subprocess, "run", return_value=result) as run:
+            certs = lego._run_lego_list(pathlib.Path("/usr/bin/lego"), (5, 5, 0))
+
+        self.assertEqual(certs, {})
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "/usr/bin/lego",
+                "certificates",
+                "list",
+                "--path",
+                str(lego.ACME_WORK_DIR),
+                "--json",
+            ],
+        )
+
+    def test_list_failure_is_not_reported_as_empty_success(self):
+        result = mock.Mock(returncode=1, stdout="", stderr="migration required")
+        with mock.patch.object(lego.subprocess, "run", return_value=result):
+            self.assertIsNone(
+                lego._run_lego_list(pathlib.Path("/usr/bin/lego"), (5, 5, 0))
+            )
+
+
 # ---------------------------------------------------------------------------
 # _cert_state
 # ---------------------------------------------------------------------------
@@ -1082,6 +1140,17 @@ class TestAccountKeyPath(_AcmeWorkDirTestCase):
             / "admin@example.com.key",
         )
 
+    def test_v4_key_uses_legacy_keys_directory(self):
+        self.assertEqual(
+            lego._account_key_path({"LEGO_EMAIL": "admin@example.com"}, (4, 9, 1)),
+            lego.ACME_WORK_DIR
+            / "accounts"
+            / "acme-v02.api.letsencrypt.org"
+            / "admin@example.com"
+            / "keys"
+            / "admin@example.com.key",
+        )
+
     def test_account_file_path_sibling_of_key(self):
         conf = {"LEGO_EMAIL": "admin@example.com"}
         key = lego._account_key_path(conf)
@@ -1183,6 +1252,49 @@ class TestSyncAccountKey(_AcmeWorkDirTestCase):
 
         self.assertEqual(rc, 1)
         self.assertEqual(internal.resolve(), other_target.resolve())
+
+    def test_v4_key_is_relocated_from_legacy_path(self):
+        internal = lego._account_key_path(self._conf, (4, 9, 1))
+        internal.parent.mkdir(parents=True)
+        internal.write_text("legacy-key-data")
+
+        rc = lego._sync_account_key(self._conf, self._output, (4, 9, 1))
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(internal.is_symlink())
+        self.assertEqual(self._target.read_text(), "legacy-key-data")
+
+
+class TestLegacyLegoStorage(_AcmeWorkDirTestCase):
+    def test_detects_v4_account_key_directory(self):
+        key_dir = (
+            lego.ACME_WORK_DIR
+            / "accounts"
+            / "acme.example.org"
+            / "admin@example.com"
+            / "keys"
+        )
+        key_dir.mkdir(parents=True)
+        self.assertTrue(lego._has_legacy_lego_storage())
+        self.assertFalse(lego._check_lego_v5_storage((5, 5, 0)))
+
+    def test_detects_v4_certificate_resource(self):
+        cert_dir = lego.ACME_WORK_DIR / "certificates"
+        cert_dir.mkdir()
+        (cert_dir / "foo.example.com.json").write_text(
+            json.dumps({"domain": "foo.example.com", "certUrl": "https://example"})
+        )
+        self.assertTrue(lego._has_legacy_lego_storage())
+
+    def test_accepts_v5_certificate_resource(self):
+        cert_dir = lego.ACME_WORK_DIR / "certificates"
+        cert_dir.mkdir()
+        (cert_dir / "foo.example.com.json").write_text(
+            json.dumps({"id": "foo.example.com", "domains": ["foo.example.com"]})
+        )
+        self.assertFalse(lego._has_legacy_lego_storage())
+
+
 # ---------------------------------------------------------------------------
 # _lego_release_asset_names
 # ---------------------------------------------------------------------------

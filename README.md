@@ -85,6 +85,23 @@ Or download a pre-built binary yourself from the
 [lego releases page](https://github.com/go-acme/lego/releases) and place it
 somewhere in your `PATH`.
 
+### Upgrading existing data from lego v4 to v5
+
+lego v5 changed its on-disk account and certificate metadata formats. Before
+using a v5 binary with certificates or accounts created by v4, make a backup
+of `/var/lib/acme` and run its interactive migration once:
+
+```bash
+sudo lego migrate --path /var/lib/acme
+```
+
+Confirm the migration when prompted. The migration updates lego's storage in
+place; the suggested `.lego.migration.*.yml` file is informational for this
+wrapper, which continues to pass its settings on the command line. `lego.py`
+detects common v4 storage layouts and refuses to issue/register with v5 until
+the migration has been completed. New installs and v4-only installs do not
+need this step.
+
 > **Known issue — Debian/Ubuntu/Proxmox `apt` package:** the distro-packaged
 > `lego` binary (as of 4.9.1-2) is a non-standard build: `lego -v` prints
 > `lego version dev` with no parseable version, and it's often missing most

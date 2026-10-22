@@ -219,18 +219,22 @@ interactively, but something to avoid relying on under the unattended
 ### Account Key Relocation
 
 lego has no flag to store just the account private key somewhere other
-than under `--path` (`/var/lib/acme/accounts/<sanitized-server-host>/
-<email>/<email>.key` — `_sanitize_host()` mirrors lego's own
-`AccountsStorage.sanitizeHost()`, and lego.py never passes an explicit
-account ID, so the effective ID is always the email). Setting
+than under `--path`. lego v5 stores it at
+`/var/lib/acme/accounts/<sanitized-server-host>/<email>/<email>.key`;
+v4 adds a `keys/` directory before the filename. `_account_key_path()`
+must take the detected lego version into account. `_sanitize_host()`
+mirrors lego's own `AccountsStorage.sanitizeHost()`, and lego.py never
+passes an explicit account ID, so the effective ID is always the email.
+Setting
 `LEGO_ACCOUNT_KEY_PATH` doesn't change what lego does — `_sync_account_key()`
 instead pre-creates (or migrates an existing key into) that path and
 leaves a symlink in lego's own expected location pointing to it, run
 before every `_run_lego()` invocation and in `cmd_account_register()`.
 lego reads/writes through the symlink transparently and never needs to
-know. `_account_key_path()` computes lego's expected internal path; keep
-it in sync with lego's `cmd/internal/storage/storage_accounts.go` if that
-layout ever changes upstream.
+know. lego v5 also requires its interactive `lego migrate --path
+/var/lib/acme` step before it can use v4 account/certificate metadata;
+the wrapper checks for common legacy layouts rather than attempting that
+in-place migration automatically.
 
 ## Subcommands
 
