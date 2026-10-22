@@ -21,6 +21,7 @@ import tempfile
 import textwrap
 import typing
 import urllib.error
+import urllib.parse
 import urllib.request
 
 __version__ = "0.6.0"
@@ -36,6 +37,11 @@ ACME_CONF = ACME_DIR / "acme.conf"
 ACME_WORK_DIR = pathlib.Path("/var/lib/acme")
 CERT_DIR = ACME_WORK_DIR / "certificates"
 SYSTEMD_DIR = pathlib.Path("/etc/systemd/system")
+
+# lego's own default when --server/LEGO_SERVER is unset. Kept in sync with
+# lego's lego.DirectoryURLLetsEncrypt so _account_key_path() computes the
+# right path even when LEGO_SERVER has been left unset.
+_LEGO_DEFAULT_SERVER = "https://acme-v02.api.letsencrypt.org/directory"
 
 # TODO: update after repo is renamed on GitHub
 WIKI_INSTALL_URL = "https://github.com/user/lego.py/wiki/Installation"
@@ -94,7 +100,28 @@ LEGO_SERVER="https://acme-v02.api.letsencrypt.org/directory"
 # Account email address
 LEGO_EMAIL=""
 
-# DNS provider name — see https://go-acme.github.io/lego/dns/
+# ACME challenge type — required, no default. One of:
+#   dns-01          — needs LEGO_DNS + provider credentials below.
+#                   Supports wildcards; works with no public-facing service.
+#   http-01         — serves the challenge over port 80, or from
+#                     LEGO_HTTP_WEBROOT if set. No wildcard support.
+#   dns-persist-01  — no DNS provider or API credentials needed at all.
+#                     Instead, you deploy one persistent
+#                     '_validation-persist.<domain>' TXT record by hand,
+#                     out-of-band, up front — run 'lego.py account register'
+#                     first to get the account URL that record must contain
+#                     (see the README's "DNS-PERSIST-01" section for the
+#                     exact format). lego.py never creates, reads, or
+#                     modifies that record itself. Once it's in place,
+#                     every issuance and renewal (including unattended runs
+#                     from the systemd timer) just verifies it's still
+#                     there — no further DNS changes, no interaction.
+#                     (If you run 'lego.py issue' before deploying the
+#                     record, lego falls back to prompting on stdin, which
+#                     only works from a real terminal — not recommended.)
+LEGO_CHALLENGE=""
+
+# DNS provider name (dns-01 only) — see https://go-acme.github.io/lego/dns/
 LEGO_DNS=""
 
 # Override lego version detection if 'lego --version' can't be parsed
@@ -102,10 +129,33 @@ LEGO_DNS=""
 # One of: auto, 4, 5. Defaults to auto.
 #LEGO_VERSION="auto"
 
-# Resolver(s) for DNS-01 challenge verification (host:port, comma-separated).
-# Defaults to Cloudflare's public DNS to avoid split-DNS issues where the
-# system resolver is authoritative for internal zones.
+# Resolver(s) for DNS-01/dns-persist-01 challenge verification (host:port,
+# comma-separated). Defaults to Cloudflare's public DNS to avoid split-DNS
+# issues where the system resolver is authoritative for internal zones.
 LEGO_DNS_RESOLVERS="1.1.1.1:53"
+
+# http-01 only: serve challenge files from this webroot (an existing web
+# server's docroot) instead of lego's built-in standalone server on port 80.
+#LEGO_HTTP_WEBROOT="/var/www/html"
+
+# dns-persist-01 only: override which issuer-domain-name to use when the
+# TXT record authorizes multiple CAs. Must match one offered by the CA.
+#LEGO_DNS_PERSIST_ISSUER_DOMAIN_NAME=""
+
+# dns-persist-01 only: optional expiry (RFC3339 UTC) for the persistent TXT
+# record, e.g. "2027-01-01T00:00:00Z". Must match whatever persistUntil (if
+# any) you put in the deployed TXT record, and must be renewed/extended in
+# DNS before it lapses, or renewals will fall back to the interactive flow.
+#LEGO_DNS_PERSIST_PERSIST_UNTIL=""
+
+
+# Store the ACME account private key at this path instead of under
+# /var/lib/acme/accounts/... — useful to keep it on a more tightly
+# controlled filesystem/backup set than the rest of the lego working
+# directory. lego.py creates the parent directory and the key file as
+# root-owned, mode 0700/0600, and leaves a symlink in lego's own account
+# directory pointing here; lego itself never needs to know about this.
+#LEGO_ACCOUNT_KEY_PATH="/etc/acme/keys/letsencrypt.key"
 
 # External Account Binding — required for ZeroSSL and some other CAs
 LEGO_EAB=false
@@ -809,6 +859,11 @@ def load_instance_configs() -> dict[str, InstanceConfig]:
 # ---------------------------------------------------------------------------
 
 
+def _split_csv(value: str) -> list[str]:
+    """Split a comma-separated config value into a list of trimmed, non-empty items."""
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
 def _build_lego_run_cmd(
     lego: pathlib.Path,
     conf: dict[str, str],
@@ -844,7 +899,32 @@ def _build_lego_run_cmd(
     for domain in domains:
         cmd += ["-d", domain]
 
-    cmd += ["--dns", conf["LEGO_DNS"]]
+    challenge = (conf.get("LEGO_CHALLENGE") or "").lower()
+
+    if challenge == "dns-01":
+        cmd += ["--dns", conf["LEGO_DNS"]]
+        for resolver in _split_csv(conf.get("LEGO_DNS_RESOLVERS", "")):
+            cmd += ["--dns.resolvers", resolver]
+    elif challenge == "http-01":
+        cmd.append("--http")
+        if webroot := conf.get("LEGO_HTTP_WEBROOT"):
+            cmd += ["--http.webroot", webroot]
+    elif challenge == "dns-persist-01":
+        # Manual-only challenge: lego prompts on stdin to create the
+        # '_validation-persist' TXT record the first time it's missing, then
+        # reuses it for every later issuance/renewal without touching DNS
+        # again. See _CONFIG_SCHEMA / the acme.conf comments for details.
+        cmd.append("--dns-persist")
+        if issuer := conf.get("LEGO_DNS_PERSIST_ISSUER_DOMAIN_NAME"):
+            cmd += ["--dns-persist.issuer-domain-name", issuer]
+        if persist_until := conf.get("LEGO_DNS_PERSIST_PERSIST_UNTIL"):
+            cmd += ["--dns-persist.persist-until", persist_until]
+        # Reuses the same resolver list as DNS-01 — both challenges share the
+        # same split-DNS propagation-check concern.
+        for resolver in _split_csv(conf.get("LEGO_DNS_RESOLVERS", "")):
+            cmd += ["--dns-persist.resolvers", resolver]
+    else:
+        raise ValueError(f"unknown LEGO_CHALLENGE: {challenge!r}")
 
     if conf.get("LEGO_EAB", "").lower() == "true":
         if v5:
@@ -854,13 +934,6 @@ def _build_lego_run_cmd(
 
     if conf.get("LEGO_PFX", "").lower() == "true":
         cmd += ["--pfx", "--pfx.password", conf.get("LEGO_PFX_PASSWORD", "")]
-
-    for resolver in (
-        r.strip()
-        for r in conf.get("LEGO_DNS_RESOLVERS", "").split(",")
-        if r.strip()
-    ):
-        cmd += ["--dns.resolvers", resolver]
 
     if v5:
         if hook:
@@ -953,13 +1026,35 @@ def _validate_lego_version(v: str) -> str | None:
 
 
 def _validate_dns_resolvers(v: str) -> str | None:
-    parts = [p.strip() for p in v.split(",") if p.strip()]
+    parts = _split_csv(v)
     if not parts:
         return "expected one or more host:port addresses"
     for p in parts:
         if ":" not in p:
             return f"expected host:port format, got {p!r}"
     return None
+
+
+def _validate_challenge(v: str) -> str | None:
+    return (
+        None
+        if v.lower() in ("dns-01", "http-01", "dns-persist-01")
+        else "expected one of: dns-01, http-01, dns-persist-01"
+    )
+
+
+def _validate_rfc3339(v: str) -> str | None:
+    try:
+        datetime.datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return "expected an RFC3339 UTC timestamp, e.g. 2026-03-01T00:00:00Z"
+    return None
+
+
+def _validate_abs_path(v: str) -> str | None:
+    if pathlib.PurePosixPath(v).is_absolute():
+        return None
+    return "expected an absolute path"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -974,12 +1069,17 @@ class _ConfigKey:
 _CONFIG_SCHEMA: list[_ConfigKey] = [
     _ConfigKey("LEGO_SERVER",       "server",       "ACME directory URL",              _validate_https_url),
     _ConfigKey("LEGO_EMAIL",        "email",        "account email address",           _validate_email),
-    _ConfigKey("LEGO_DNS",          "dns",          "DNS provider name",               _validate_nonempty),
+    _ConfigKey("LEGO_CHALLENGE",    "challenge",    "ACME challenge type, required (dns-01, http-01, or dns-persist-01)", _validate_challenge),
+    _ConfigKey("LEGO_DNS",          "dns",          "DNS provider name (dns-01 only)",  _validate_nonempty),
     _ConfigKey("LEGO_VERSION",      "lego-version", "override lego version detection (auto, 4, or 5)", _validate_lego_version),
     _ConfigKey("LEGO_EAB",          "eab",          "enable External Account Binding", _validate_bool),
     _ConfigKey("LEGO_EAB_KID",      "eab-kid",      "EAB key ID",                      _validate_nonempty, sensitive=True),
     _ConfigKey("LEGO_EAB_HMAC",     "eab-hmac",     "EAB HMAC key",                    _validate_nonempty, sensitive=True),
-    _ConfigKey("LEGO_DNS_RESOLVERS", "dns-resolvers", "resolver(s) for DNS-01 verification (host:port, comma-separated)", _validate_dns_resolvers),
+    _ConfigKey("LEGO_DNS_RESOLVERS", "dns-resolvers", "resolver(s) for DNS-01/dns-persist-01 verification (host:port, comma-separated)", _validate_dns_resolvers),
+    _ConfigKey("LEGO_HTTP_WEBROOT", "http-webroot", "serve http-01 challenge files from this webroot instead of a standalone server", None),
+    _ConfigKey("LEGO_DNS_PERSIST_ISSUER_DOMAIN_NAME", "dns-persist-issuer", "override the issuer-domain-name for dns-persist-01 (when multiple are offered)", _validate_nonempty),
+    _ConfigKey("LEGO_DNS_PERSIST_PERSIST_UNTIL", "dns-persist-until", "optional persistUntil RFC3339 timestamp for dns-persist-01 records", _validate_rfc3339),
+    _ConfigKey("LEGO_ACCOUNT_KEY_PATH", "account-key-path", "store the ACME account private key here instead of under /var/lib/acme (0600, root-owned)", _validate_abs_path),
     _ConfigKey("LEGO_PFX",          "pfx",          "generate PKCS#12 file",           _validate_bool),
     _ConfigKey("LEGO_PFX_PASSWORD", "pfx-password", "PKCS#12 password",                None, sensitive=True),
     _ConfigKey("LEGO_PFX_FORMAT",   "pfx-format",   "PKCS#12 hash format (RC2/DES/SHA256)", _validate_pfx_format),
@@ -1202,8 +1302,23 @@ def _load_lego_conf(instance: str) -> tuple[dict[str, str], list[str]] | None:
         log.error("no -d domains found in %s", env_file)
         return None
 
-    # Fail early on missing required fields.
-    missing = [k for k in ("LEGO_EMAIL", "LEGO_DNS") if not conf.get(k)]
+    challenge = (conf.get("LEGO_CHALLENGE") or "").lower()
+    if challenge not in ("dns-01", "http-01", "dns-persist-01"):
+        log.error(
+            "LEGO_CHALLENGE not set (or invalid: %r) — must be one of:"
+            " dns-01, http-01, dns-persist-01. Set it with"
+            " 'lego.py config set challenge <type>'.",
+            conf.get("LEGO_CHALLENGE"),
+        )
+        return None
+
+    # Fail early on missing required fields. LEGO_DNS only matters for the
+    # dns-01 challenge — http-01 and dns-persist-01 don't use a DNS
+    # provider at all.
+    required = ["LEGO_EMAIL"]
+    if challenge == "dns-01":
+        required.append("LEGO_DNS")
+    missing = [k for k in required if not conf.get(k)]
     if missing:
         log.error("required config missing: %s", ", ".join(missing))
         return None
@@ -1218,6 +1333,111 @@ def _load_lego_conf(instance: str) -> tuple[dict[str, str], list[str]] | None:
             return None
 
     return conf, domains
+
+
+def _sanitize_host(server: str) -> str:
+    """Mirror lego's own account-storage host sanitization.
+
+    lego derives the account directory name from the server URL's host,
+    replacing ':', '/', and '\\' with '_' (see AccountsStorage.sanitizeHost
+    in lego's cmd/internal/storage package) — e.g. a pebble-style
+    "localhost:14000" server becomes "localhost_14000".
+    """
+    host = urllib.parse.urlsplit(server).netloc
+    return re.sub(r"[:/\\]", "_", host)
+
+
+def _account_key_path(conf: dict[str, str]) -> pathlib.Path:
+    """Compute the account private key path lego itself manages under ACME_WORK_DIR.
+
+    lego lays out account data as
+    ``<path>/accounts/<sanitized-server-host>/<account-id>/<account-id>.key``.
+    lego.py never passes an explicit account ID, so the effective account ID
+    is always the account email (lego falls back to it when none is given).
+    """
+    server = conf.get("LEGO_SERVER") or _LEGO_DEFAULT_SERVER
+    email = conf["LEGO_EMAIL"]
+    return ACME_WORK_DIR / "accounts" / _sanitize_host(server) / email / f"{email}.key"
+
+
+def _account_file_path(conf: dict[str, str]) -> pathlib.Path:
+    """Compute the account.json path lego itself manages under ACME_WORK_DIR.
+
+    Same layout as _account_key_path(), just the registration record lego
+    writes alongside the key instead of the key itself.
+    """
+    server = conf.get("LEGO_SERVER") or _LEGO_DEFAULT_SERVER
+    email = conf["LEGO_EMAIL"]
+    return ACME_WORK_DIR / "accounts" / _sanitize_host(server) / email / "account.json"
+
+
+def _read_account_url(conf: dict[str, str]) -> str | None:
+    """Read the ACME account URL lego recorded in account.json after registration.
+
+    This is the 'accounturi=' value a DNS-PERSIST-01 '_validation-persist' TXT
+    record must contain — see 'lego.py account register'.
+    """
+    try:
+        data = json.loads(_account_file_path(conf).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return (data.get("registration") or {}).get("accountURL") or None
+
+
+def _sync_account_key(conf: dict[str, str], output: Output) -> int:
+    """Relocate the ACME account private key to LEGO_ACCOUNT_KEY_PATH, if configured.
+
+    lego has no native flag to store just the account key somewhere other
+    than --path, so this keeps the real key file at LEGO_ACCOUNT_KEY_PATH
+    (root-owned, 0600, in its own root-owned 0700 directory) and leaves a
+    symlink in its place under /var/lib/acme/accounts/... — lego reads and
+    writes through that symlink transparently, same as any other file. Safe
+    to call on every issue/renew-exec invocation; it's a no-op once the
+    symlink is already in place.
+    """
+    target = pathlib.Path(conf["LEGO_ACCOUNT_KEY_PATH"])
+    internal = _account_key_path(conf)
+
+    try:
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.parent.chmod(0o700)
+    except OSError as exc:
+        log.error("could not create %s: %s", target.parent, exc)
+        return 1
+
+    if internal.is_symlink():
+        if internal.resolve(strict=False) != target.resolve(strict=False):
+            log.error(
+                "%s is already a symlink to %s, not %s — resolve manually before retrying",
+                internal, internal.resolve(strict=False), target,
+            )
+            return 1
+    elif internal.exists():
+        # First run with LEGO_ACCOUNT_KEY_PATH newly set and lego already has
+        # a real key on disk — migrate it to its new permanent home.
+        if target.exists():
+            log.error(
+                "%s already exists and %s is an unmigrated lego-managed key —"
+                " resolve manually before retrying",
+                target, internal,
+            )
+            return 1
+        shutil.move(str(internal), str(target))
+        output.step("migrated", f"{internal} -> {target}")
+    else:
+        try:
+            internal.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error("could not create %s: %s", internal.parent, exc)
+            return 1
+
+    if not internal.is_symlink():
+        internal.symlink_to(target)
+
+    if target.exists():
+        target.chmod(0o600)
+
+    return 0
 
 
 def _hook_env(instance: str, domains: list[str]) -> dict[str, str]:
@@ -1244,9 +1464,23 @@ def _run_lego(
     conf: dict[str, str],
     domains: list[str],
     action: typing.Literal["issue", "renew"],
+    output: Output,
 ) -> int:
     """Detect the lego version, build the command, and run it. Returns the exit status."""
     lego_ver = _resolve_lego_version(lego, conf.get("LEGO_VERSION"))
+
+    challenge = (conf.get("LEGO_CHALLENGE") or "").lower()
+    if challenge == "dns-persist-01" and lego_ver < (5, 0, 0):
+        log.error(
+            "LEGO_CHALLENGE=dns-persist-01 requires lego v5 or newer (detected %s)",
+            ".".join(str(x) for x in lego_ver),
+        )
+        return 1
+
+    if conf.get("LEGO_ACCOUNT_KEY_PATH"):
+        if _sync_account_key(conf, output) != 0:
+            return 1
+
     cmd = _build_lego_run_cmd(lego, conf, domains, conf.get("HOOK", ""), lego_ver, action)
     log.debug("lego command: %s", " ".join(cmd))
 
@@ -1285,7 +1519,7 @@ def cmd_issue(args: argparse.Namespace, output: Output) -> int:
         return 1
 
     log.info("issuing certificate for instance %r (%s)...", instance, domains[0])
-    if _run_lego(lego, instance, conf, domains, "issue") != 0:
+    if _run_lego(lego, instance, conf, domains, "issue", output) != 0:
         return 1
 
     # Enable and start the renewal timer now that a cert exists.
@@ -1321,7 +1555,7 @@ def cmd_renew_exec(args: argparse.Namespace, output: Output) -> int:
     conf, domains = loaded
 
     log.info("renewing certificate for instance %r (%s)...", instance, domains[0])
-    return _run_lego(lego, instance, conf, domains, "renew")
+    return _run_lego(lego, instance, conf, domains, "renew", output)
 
 
 def cmd_renew(args: argparse.Namespace, output: Output) -> int:
@@ -1390,6 +1624,91 @@ def cmd_hook(args: argparse.Namespace, output: Output) -> int:
         return 1
 
     output.value("Done. Hook ran successfully.")
+    return 0
+
+
+def cmd_account_register(args: argparse.Namespace, output: Output) -> int:
+    """Register (if needed) the global ACME account and report its URL and key path.
+
+    This exists for the DNS-PERSIST-01 workflow: that challenge's
+    '_validation-persist.<domain>' TXT record must be deployed out-of-band,
+    by hand, *before* running 'lego.py issue' — lego.py never creates,
+    inspects, or modifies that record, and never needs DNS provider
+    credentials for it. This command only gets you the one piece of data
+    you can't invent yourself: the account's URL. See the README's
+    "DNS-PERSIST-01" section for the exact TXT record format to publish
+    with it.
+
+    Requires lego v5+ — the 'accounts' command group doesn't exist in v4.
+    """
+    require_root()
+    lego_bin = require_lego()
+
+    if not ACME_CONF.exists():
+        log.error(
+            "no configuration file at %s — run 'lego.py install' first", ACME_CONF
+        )
+        return 1
+    try:
+        conf = parse_env_file(ACME_CONF)
+    except OSError as exc:
+        log.error("could not read %s: %s", ACME_CONF, exc)
+        return 1
+
+    if not conf.get("LEGO_EMAIL"):
+        log.error("required config missing: LEGO_EMAIL")
+        return 1
+
+    lego_ver = _resolve_lego_version(lego_bin, conf.get("LEGO_VERSION"))
+    if lego_ver < (5, 0, 0):
+        log.error(
+            "'account register' requires lego v5 or newer (detected %s) —"
+            " v4's CLI has no 'accounts' command group",
+            ".".join(str(x) for x in lego_ver),
+        )
+        return 1
+
+    if conf.get("LEGO_ACCOUNT_KEY_PATH"):
+        if _sync_account_key(conf, output) != 0:
+            return 1
+
+    cmd = [
+        str(lego_bin), "accounts", "register",
+        "--path", str(ACME_WORK_DIR),
+        "--accept-tos",
+        "--email", conf["LEGO_EMAIL"],
+    ]
+    if server := conf.get("LEGO_SERVER"):
+        cmd += ["--server", server]
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        log.error("lego accounts register failed (exit %d)", exc.returncode)
+        return 1
+
+    url = _read_account_url(conf)
+    if url is None:
+        log.error(
+            "registered the account but could not read its URL from %s",
+            _account_file_path(conf),
+        )
+        return 1
+
+    key_path = (
+        pathlib.Path(conf["LEGO_ACCOUNT_KEY_PATH"])
+        if conf.get("LEGO_ACCOUNT_KEY_PATH")
+        else _account_key_path(conf)
+    )
+
+    output.step("account-url", url)
+    output.step("key-path", str(key_path))
+    output.step(
+        "hint",
+        "For DNS-PERSIST-01, publish a TXT record at "
+        "_validation-persist.<domain> containing this account URL before"
+        " running 'lego.py issue' — see the README's DNS-PERSIST-01 section.",
+    )
     return 0
 
 
@@ -1753,6 +2072,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hook.add_argument("instance", help="certificate instance name")
     p_hook.set_defaults(func=cmd_hook)
+
+    # -- account ----------------------------------------------------------------
+    p_account = subparsers.add_parser(
+        "account",
+        help="manage the global ACME account",
+        description="Register the ACME account and inspect its details.",
+        formatter_class=_HelpFmt,
+    )
+    p_account.set_defaults(func=lambda args, out: (p_account.print_help(), 1)[1])
+
+    account_subs = p_account.add_subparsers(
+        dest="account_command",
+        metavar="COMMAND",
+        title="account commands",
+    )
+
+    p_account_register = account_subs.add_parser(
+        "register",
+        help="register the ACME account and print its URL and key path",
+        description=textwrap.dedent(
+            """\
+            Registers the ACME account for LEGO_EMAIL/LEGO_SERVER (if not
+            already registered) and prints its account URL and private key
+            path.
+
+            Mainly useful for DNS-PERSIST-01, which needs the account URL to
+            put in the '_validation-persist.<domain>' TXT record you deploy
+            by hand — lego.py never touches DNS for that challenge. See the
+            README's "DNS-PERSIST-01" section for the exact record format.
+
+            Requires root and lego v5+.
+            """
+        ),
+        formatter_class=_RawDescFmt,
+    )
+    p_account_register.set_defaults(func=cmd_account_register)
 
     # -- status ---------------------------------------------------------------
     p_status = subparsers.add_parser(

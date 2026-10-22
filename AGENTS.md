@@ -183,6 +183,55 @@ did. `cmd_install()` bakes the *absolute path to lego.py itself*
 (`pathlib.Path(__file__).resolve()`) into `ExecStart` — re-run
 `lego.py install` if you move or reinstall lego.py to a new location.
 
+### Challenge Types
+
+`LEGO_CHALLENGE` is required, with **no default** — `_load_lego_conf()`
+rejects a missing/invalid value outright rather than silently assuming
+`dns-01` (this was a deliberate breaking change from the original
+single-challenge design; pre-existing installs must explicitly run
+`lego.py config set challenge dns-01` once to keep working). It selects
+which ACME challenge `_build_lego_run_cmd()` builds flags for: `dns-01`
+(`--dns`, needs `LEGO_DNS` + provider credentials in the env), `http-01`
+(`--http`, optionally `--http.webroot`), or `dns-persist-01`
+(`--dns-persist`, v5-only — gated in `_run_lego()` since the
+`--dns-persist` flag and the `accounts` command group don't exist in lego
+v4 at all). `_load_lego_conf()` only requires `LEGO_DNS` when the
+challenge is `dns-01`.
+
+DNS-PERSIST-01 ([draft-ietf-acme-dns-persist](https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-01))
+trades DNS-01's per-issuance TXT record for one persistent
+`_validation-persist.<domain>` record binding the domain to a specific
+ACME account — published once, out-of-band, and reused by every later
+issuance/renewal with no further DNS changes. **lego.py deliberately never
+creates, reads, or writes that record itself** — the design goal is zero
+DNS provider credentials for this challenge. `cmd_account_register()`
+(`lego.py account register`) exists solely to surface the one fact an
+operator can't invent themselves: the account's URL (read back from the
+`registration.accountURL` field lego writes to `account.json` after
+`lego accounts register`), via `_account_file_path()` /
+`_read_account_url()`, which mirror lego's own account storage layout
+(see Account Key Relocation below). Left alone, lego's own fallback for a
+missing/expired record is to prompt on stdin — fine when `issue` is run
+interactively, but something to avoid relying on under the unattended
+`renew-exec` timer path, where it fails fast instead of hanging (stdin is
+`/dev/null` under systemd) rather than actually blocking.
+
+### Account Key Relocation
+
+lego has no flag to store just the account private key somewhere other
+than under `--path` (`/var/lib/acme/accounts/<sanitized-server-host>/
+<email>/<email>.key` — `_sanitize_host()` mirrors lego's own
+`AccountsStorage.sanitizeHost()`, and lego.py never passes an explicit
+account ID, so the effective ID is always the email). Setting
+`LEGO_ACCOUNT_KEY_PATH` doesn't change what lego does — `_sync_account_key()`
+instead pre-creates (or migrates an existing key into) that path and
+leaves a symlink in lego's own expected location pointing to it, run
+before every `_run_lego()` invocation and in `cmd_account_register()`.
+lego reads/writes through the symlink transparently and never needs to
+know. `_account_key_path()` computes lego's expected internal path; keep
+it in sync with lego's `cmd/internal/storage/storage_accounts.go` if that
+layout ever changes upstream.
+
 ## Subcommands
 
 | Command              | Root? | Description                                 |
@@ -193,6 +242,7 @@ did. `cmd_install()` bakes the *absolute path to lego.py itself*
 | `renew <instance>`   | Yes   | `systemctl start acme@<instance>.service`   |
 | `renew-exec <instance>` (hidden) | Yes | Actual lego invocation; called by the systemd unit, not users |
 | `hook <instance>`    | Yes   | Manually run the instance's HOOK against its current cert |
+| `account register`   | Yes   | Register the ACME account; print its URL + key path (requires lego v5+) |
 | `status`             | No    | Cert expiry table across all instances      |
 | `config show`        | No    | Display acme.conf (secrets masked)          |
 | `config get <key>`   | No    | Print a single config value                 |

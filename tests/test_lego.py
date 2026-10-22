@@ -1,10 +1,12 @@
 """Unit tests for lego.py pure-logic functions."""
 
 import datetime
+import json
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 # Allow running from repo root: python3 -m unittest discover -s tests -v
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -378,6 +380,7 @@ class TestBuildLegoRunCmdV4(unittest.TestCase):
     _VER = (4, 9, 1)
     _BASE_CONF = {
         "LEGO_EMAIL": "admin@example.com",
+        "LEGO_CHALLENGE": "dns-01",
         "LEGO_DNS": "cloudflare",
     }
     _DOMAINS = ["foo.example.com", "bar.example.com"]
@@ -522,6 +525,7 @@ class TestBuildLegoRunCmdV5(unittest.TestCase):
     _VER = (5, 4, 0)
     _BASE_CONF = {
         "LEGO_EMAIL": "admin@example.com",
+        "LEGO_CHALLENGE": "dns-01",
         "LEGO_DNS": "cloudflare",
     }
     _DOMAINS = ["foo.example.com"]
@@ -564,6 +568,181 @@ class TestBuildLegoRunCmdV5(unittest.TestCase):
         cmd = self._cmd(hook="systemctl restart nginx", action="renew")
         self.assertIn("--deploy-hook", cmd)
         self.assertNotIn("--run-hook", cmd)
+
+
+class TestBuildLegoRunCmdChallenges(unittest.TestCase):
+    """LEGO_CHALLENGE dispatch: dns-01, http-01, dns-persist-01 (no default)."""
+
+    _LEGO = pathlib.Path("/usr/bin/lego")
+    _VER = (5, 4, 0)
+    _DOMAINS = ["foo.example.com"]
+    _EMAIL_ONLY = {"LEGO_EMAIL": "admin@example.com"}
+
+    def _cmd(self, conf: dict) -> list[str]:
+        return lego._build_lego_run_cmd(
+            self._LEGO, conf, self._DOMAINS, "", self._VER, "issue"
+        )
+
+    def test_unset_challenge_raises(self):
+        # No LEGO_CHALLENGE and no default — must not silently assume dns-01.
+        conf = {**self._EMAIL_ONLY, "LEGO_DNS": "cloudflare"}
+        with self.assertRaises(ValueError):
+            self._cmd(conf)
+
+    def test_empty_challenge_raises(self):
+        conf = {**self._EMAIL_ONLY, "LEGO_CHALLENGE": "", "LEGO_DNS": "cloudflare"}
+        with self.assertRaises(ValueError):
+            self._cmd(conf)
+
+    def test_dns01_explicit(self):
+        conf = {**self._EMAIL_ONLY, "LEGO_CHALLENGE": "dns-01", "LEGO_DNS": "cloudflare"}
+        cmd = self._cmd(conf)
+        self.assertEqual(cmd[cmd.index("--dns") + 1], "cloudflare")
+
+    def test_http01_adds_http_flag(self):
+        conf = {**self._EMAIL_ONLY, "LEGO_CHALLENGE": "http-01"}
+        cmd = self._cmd(conf)
+        self.assertIn("--http", cmd)
+        self.assertNotIn("--dns", cmd)
+        self.assertNotIn("--dns-persist", cmd)
+
+    def test_http01_webroot(self):
+        conf = {
+            **self._EMAIL_ONLY,
+            "LEGO_CHALLENGE": "http-01",
+            "LEGO_HTTP_WEBROOT": "/var/www/html",
+        }
+        cmd = self._cmd(conf)
+        self.assertIn("--http.webroot", cmd)
+        self.assertEqual(cmd[cmd.index("--http.webroot") + 1], "/var/www/html")
+
+    def test_http01_no_webroot_flag_when_unset(self):
+        conf = {**self._EMAIL_ONLY, "LEGO_CHALLENGE": "http-01"}
+        cmd = self._cmd(conf)
+        self.assertNotIn("--http.webroot", cmd)
+
+    def test_dns_persist01_adds_flag(self):
+        conf = {**self._EMAIL_ONLY, "LEGO_CHALLENGE": "dns-persist-01"}
+        cmd = self._cmd(conf)
+        self.assertIn("--dns-persist", cmd)
+        self.assertNotIn("--dns", cmd)
+        self.assertNotIn("--http", cmd)
+
+    def test_dns_persist01_no_dns_required(self):
+        # Unlike dns-01, dns-persist-01 must build a command with no LEGO_DNS at all.
+        conf = {**self._EMAIL_ONLY, "LEGO_CHALLENGE": "dns-persist-01"}
+        self._cmd(conf)  # must not raise KeyError
+
+    def test_dns_persist01_issuer_domain_name(self):
+        conf = {
+            **self._EMAIL_ONLY,
+            "LEGO_CHALLENGE": "dns-persist-01",
+            "LEGO_DNS_PERSIST_ISSUER_DOMAIN_NAME": "letsencrypt.org",
+        }
+        cmd = self._cmd(conf)
+        self.assertIn("--dns-persist.issuer-domain-name", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--dns-persist.issuer-domain-name") + 1], "letsencrypt.org"
+        )
+
+    def test_dns_persist01_persist_until(self):
+        conf = {
+            **self._EMAIL_ONLY,
+            "LEGO_CHALLENGE": "dns-persist-01",
+            "LEGO_DNS_PERSIST_PERSIST_UNTIL": "2027-01-01T00:00:00Z",
+        }
+        cmd = self._cmd(conf)
+        self.assertIn("--dns-persist.persist-until", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--dns-persist.persist-until") + 1], "2027-01-01T00:00:00Z"
+        )
+
+    def test_dns_persist01_reuses_dns_resolvers(self):
+        conf = {
+            **self._EMAIL_ONLY,
+            "LEGO_CHALLENGE": "dns-persist-01",
+            "LEGO_DNS_RESOLVERS": "1.1.1.1:53,8.8.8.8:53",
+        }
+        cmd = self._cmd(conf)
+        resolvers = [
+            cmd[i + 1]
+            for i in range(len(cmd) - 1)
+            if cmd[i] == "--dns-persist.resolvers"
+        ]
+        self.assertEqual(resolvers, ["1.1.1.1:53", "8.8.8.8:53"])
+
+    def test_unknown_challenge_raises(self):
+        conf = {**self._EMAIL_ONLY, "LEGO_CHALLENGE": "tls-alpn-01"}
+        with self.assertRaises(ValueError):
+            self._cmd(conf)
+
+
+class TestLoadLegoConf(unittest.TestCase):
+    """_load_lego_conf(): LEGO_CHALLENGE is required, with no default."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        acme_dir = pathlib.Path(self._tmp.name)
+        acme_conf = acme_dir / "acme.conf"
+        dir_patcher = mock.patch.object(lego, "ACME_DIR", acme_dir)
+        conf_patcher = mock.patch.object(lego, "ACME_CONF", acme_conf)
+        dir_patcher.start()
+        conf_patcher.start()
+        self.addCleanup(dir_patcher.stop)
+        self.addCleanup(conf_patcher.stop)
+        self._acme_dir = acme_dir
+        self._acme_conf = acme_conf
+
+    def _write(self, global_conf: str, instance_conf: str, instance: str = "mysite"):
+        self._acme_conf.write_text(global_conf)
+        (self._acme_dir / f"{instance}.env").write_text(instance_conf)
+
+    def test_missing_challenge_fails(self):
+        self._write(
+            'LEGO_EMAIL="admin@example.com"\n',
+            'DOMAINS="-d mysite.example.com"\n',
+        )
+        self.assertIsNone(lego._load_lego_conf("mysite"))
+
+    def test_invalid_challenge_fails(self):
+        self._write(
+            'LEGO_EMAIL="admin@example.com"\nLEGO_CHALLENGE="tls-alpn-01"\n',
+            'DOMAINS="-d mysite.example.com"\n',
+        )
+        self.assertIsNone(lego._load_lego_conf("mysite"))
+
+    def test_http01_does_not_require_dns(self):
+        self._write(
+            'LEGO_EMAIL="admin@example.com"\nLEGO_CHALLENGE="http-01"\n',
+            'DOMAINS="-d mysite.example.com"\n',
+        )
+        result = lego._load_lego_conf("mysite")
+        self.assertIsNotNone(result)
+        _, domains = result
+        self.assertEqual(domains, ["mysite.example.com"])
+
+    def test_dns_persist01_does_not_require_dns(self):
+        self._write(
+            'LEGO_EMAIL="admin@example.com"\nLEGO_CHALLENGE="dns-persist-01"\n',
+            'DOMAINS="-d mysite.example.com"\n',
+        )
+        self.assertIsNotNone(lego._load_lego_conf("mysite"))
+
+    def test_dns01_requires_dns(self):
+        self._write(
+            'LEGO_EMAIL="admin@example.com"\nLEGO_CHALLENGE="dns-01"\n',
+            'DOMAINS="-d mysite.example.com"\n',
+        )
+        self.assertIsNone(lego._load_lego_conf("mysite"))
+
+    def test_dns01_succeeds_with_dns_set(self):
+        self._write(
+            'LEGO_EMAIL="admin@example.com"\nLEGO_CHALLENGE="dns-01"\n'
+            'LEGO_DNS="cloudflare"\n',
+            'DOMAINS="-d mysite.example.com"\n',
+        )
+        self.assertIsNotNone(lego._load_lego_conf("mysite"))
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +825,75 @@ class TestValidateLegoVersion(unittest.TestCase):
         entry = lego._resolve_config_key("lego-version")
         self.assertIsNotNone(entry)
         self.assertEqual(entry.key, "LEGO_VERSION")
+
+
+# ---------------------------------------------------------------------------
+# LEGO_CHALLENGE / DNS-PERSIST-01 / LEGO_ACCOUNT_KEY_PATH config schema
+# ---------------------------------------------------------------------------
+
+
+class TestValidateChallenge(unittest.TestCase):
+    def test_dns01_valid(self):
+        self.assertIsNone(lego._validate_challenge("dns-01"))
+
+    def test_http01_valid(self):
+        self.assertIsNone(lego._validate_challenge("http-01"))
+
+    def test_dns_persist01_valid(self):
+        self.assertIsNone(lego._validate_challenge("dns-persist-01"))
+
+    def test_case_insensitive(self):
+        self.assertIsNone(lego._validate_challenge("DNS-01"))
+
+    def test_other_invalid(self):
+        self.assertIsNotNone(lego._validate_challenge("tls-alpn-01"))
+
+    def test_empty_invalid(self):
+        # No default — an explicit choice is required.
+        self.assertIsNotNone(lego._validate_challenge(""))
+
+    def test_resolves_by_alias(self):
+        entry = lego._resolve_config_key("challenge")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.key, "LEGO_CHALLENGE")
+
+
+class TestValidateRfc3339(unittest.TestCase):
+    def test_valid_timestamp(self):
+        self.assertIsNone(lego._validate_rfc3339("2027-01-01T00:00:00Z"))
+
+    def test_missing_z_invalid(self):
+        self.assertIsNotNone(lego._validate_rfc3339("2027-01-01T00:00:00"))
+
+    def test_garbage_invalid(self):
+        self.assertIsNotNone(lego._validate_rfc3339("not-a-timestamp"))
+
+
+class TestValidateAbsPath(unittest.TestCase):
+    def test_absolute_path_valid(self):
+        self.assertIsNone(lego._validate_abs_path("/etc/acme/keys/letsencrypt.key"))
+
+    def test_relative_path_invalid(self):
+        self.assertIsNotNone(lego._validate_abs_path("keys/letsencrypt.key"))
+
+    def test_resolves_by_alias(self):
+        entry = lego._resolve_config_key("account-key-path")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.key, "LEGO_ACCOUNT_KEY_PATH")
+
+
+class TestSplitCsv(unittest.TestCase):
+    def test_splits_and_trims(self):
+        self.assertEqual(
+            lego._split_csv(" 1.1.1.1:53 , 8.8.8.8:53"),
+            ["1.1.1.1:53", "8.8.8.8:53"],
+        )
+
+    def test_empty_string(self):
+        self.assertEqual(lego._split_csv(""), [])
+
+    def test_drops_empty_items(self):
+        self.assertEqual(lego._split_csv("a,,b"), ["a", "b"])
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +1023,166 @@ class TestBuildStatusRows(unittest.TestCase):
         self.assertEqual(styles[0], "dim")
 
 
+# ---------------------------------------------------------------------------
+# Account key relocation (LEGO_ACCOUNT_KEY_PATH)
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeHost(unittest.TestCase):
+    def test_simple_host(self):
+        self.assertEqual(
+            lego._sanitize_host("https://acme-v02.api.letsencrypt.org/directory"),
+            "acme-v02.api.letsencrypt.org",
+        )
+
+    def test_host_with_port(self):
+        self.assertEqual(
+            lego._sanitize_host("https://localhost:14000/dir"), "localhost_14000"
+        )
+
+
+class _AcmeWorkDirTestCase(unittest.TestCase):
+    """Base class that points lego.ACME_WORK_DIR at a scratch directory."""
+
+    def setUp(self):
+        self._work_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._work_tmp.cleanup)
+        patcher = mock.patch.object(
+            lego, "ACME_WORK_DIR", pathlib.Path(self._work_tmp.name)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestAccountKeyPath(_AcmeWorkDirTestCase):
+    def test_default_server_used_when_unset(self):
+        conf = {"LEGO_EMAIL": "admin@example.com"}
+        path = lego._account_key_path(conf)
+        self.assertEqual(
+            path,
+            lego.ACME_WORK_DIR
+            / "accounts"
+            / "acme-v02.api.letsencrypt.org"
+            / "admin@example.com"
+            / "admin@example.com.key",
+        )
+
+    def test_uses_configured_server(self):
+        conf = {
+            "LEGO_EMAIL": "admin@example.com",
+            "LEGO_SERVER": "https://localhost:14000/dir",
+        }
+        path = lego._account_key_path(conf)
+        self.assertEqual(
+            path,
+            lego.ACME_WORK_DIR
+            / "accounts"
+            / "localhost_14000"
+            / "admin@example.com"
+            / "admin@example.com.key",
+        )
+
+    def test_account_file_path_sibling_of_key(self):
+        conf = {"LEGO_EMAIL": "admin@example.com"}
+        key = lego._account_key_path(conf)
+        acct = lego._account_file_path(conf)
+        self.assertEqual(acct, key.parent / "account.json")
+
+
+class TestReadAccountUrl(_AcmeWorkDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self._conf = {"LEGO_EMAIL": "admin@example.com"}
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(lego._read_account_url(self._conf))
+
+    def test_reads_account_url(self):
+        account_file = lego._account_file_path(self._conf)
+        account_file.parent.mkdir(parents=True)
+        account_file.write_text(
+            json.dumps({"registration": {"accountURL": "https://example.com/acct/1"}})
+        )
+        self.assertEqual(
+            lego._read_account_url(self._conf), "https://example.com/acct/1"
+        )
+
+    def test_malformed_json_returns_none(self):
+        account_file = lego._account_file_path(self._conf)
+        account_file.parent.mkdir(parents=True)
+        account_file.write_text("not json")
+        self.assertIsNone(lego._read_account_url(self._conf))
+
+    def test_missing_registration_returns_none(self):
+        account_file = lego._account_file_path(self._conf)
+        account_file.parent.mkdir(parents=True)
+        account_file.write_text(json.dumps({"email": "admin@example.com"}))
+        self.assertIsNone(lego._read_account_url(self._conf))
+
+
+class TestSyncAccountKey(_AcmeWorkDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self._key_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._key_tmp.cleanup)
+        self._output = lego.PlainOutput()
+        self._target = pathlib.Path(self._key_tmp.name) / "keys" / "letsencrypt.key"
+        self._conf = {
+            "LEGO_EMAIL": "admin@example.com",
+            "LEGO_ACCOUNT_KEY_PATH": str(self._target),
+        }
+
+    def test_fresh_setup_creates_symlink_and_dirs(self):
+        rc = lego._sync_account_key(self._conf, self._output)
+
+        self.assertEqual(rc, 0)
+        internal = lego._account_key_path(self._conf)
+        self.assertTrue(internal.is_symlink())
+        self.assertEqual(internal.resolve(), self._target.resolve())
+        self.assertEqual(self._target.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_migrates_existing_key(self):
+        internal = lego._account_key_path(self._conf)
+        internal.parent.mkdir(parents=True)
+        internal.write_text("existing-key-data")
+
+        rc = lego._sync_account_key(self._conf, self._output)
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(internal.is_symlink())
+        self.assertEqual(self._target.read_text(), "existing-key-data")
+        self.assertEqual(self._target.stat().st_mode & 0o777, 0o600)
+
+    def test_idempotent_second_call(self):
+        self.assertEqual(lego._sync_account_key(self._conf, self._output), 0)
+        self.assertEqual(lego._sync_account_key(self._conf, self._output), 0)
+        internal = lego._account_key_path(self._conf)
+        self.assertTrue(internal.is_symlink())
+
+    def test_refuses_when_both_real_files_exist(self):
+        internal = lego._account_key_path(self._conf)
+        internal.parent.mkdir(parents=True)
+        internal.write_text("old-key")
+        self._target.parent.mkdir(parents=True)
+        self._target.write_text("already-migrated-key")
+
+        rc = lego._sync_account_key(self._conf, self._output)
+
+        self.assertEqual(rc, 1)
+        self.assertFalse(internal.is_symlink())
+        self.assertEqual(internal.read_text(), "old-key")
+
+    def test_refuses_symlink_pointing_elsewhere(self):
+        internal = lego._account_key_path(self._conf)
+        internal.parent.mkdir(parents=True)
+        other_target = pathlib.Path(self._key_tmp.name) / "other.key"
+        other_target.write_text("other-key-data")
+        internal.symlink_to(other_target)
+
+        rc = lego._sync_account_key(self._conf, self._output)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(internal.resolve(), other_target.resolve())
 # ---------------------------------------------------------------------------
 # _lego_release_asset_names
 # ---------------------------------------------------------------------------

@@ -129,6 +129,7 @@ lego.py status
 | `issue <instance>`       | Yes  | Initial certificate issuance via lego CLI      |
 | `renew <instance>`       | Yes  | Immediately trigger renewal via systemctl      |
 | `hook <instance>`        | Yes  | Manually run the instance's configured HOOK    |
+| `account register`       | Yes  | Register the ACME account; print its URL + key path |
 | `status`                 | No   | Show expiry and timer state for all certs      |
 | `config show`            | No   | Display acme.conf with secrets masked          |
 | `config get <key>`       | No   | Print a single config value                    |
@@ -148,25 +149,102 @@ Global flags (before the subcommand):
 
 Created by `lego.py install`. Known keys (use the alias with `config set`):
 
-| Alias           | Env var              | Description                              |
-|-----------------|----------------------|------------------------------------------|
-| `server`        | `LEGO_SERVER`        | ACME directory URL                       |
-| `email`         | `LEGO_EMAIL`         | Account email address                    |
-| `dns`           | `LEGO_DNS`           | lego DNS provider name                   |
-| `lego-version`  | `LEGO_VERSION`       | Override lego version detection: auto, 4, or 5 |
-| `dns-resolvers` | `LEGO_DNS_RESOLVERS` | Resolver(s) for DNS-01 (host:port)       |
-| `eab`           | `LEGO_EAB`           | Enable External Account Binding          |
-| `eab-kid`       | `LEGO_EAB_KID`       | EAB key ID                               |
-| `eab-hmac`      | `LEGO_EAB_HMAC`      | EAB HMAC key                             |
-| `pfx`           | `LEGO_PFX`           | Generate PKCS#12 alongside PEM files     |
-| `pfx-password`  | `LEGO_PFX_PASSWORD`  | PKCS#12 password                         |
-| `pfx-format`    | `LEGO_PFX_FORMAT`    | PKCS#12 hash format: RC2, DES, SHA256    |
+| Alias                  | Env var                             | Description                              |
+|-------------------------|-------------------------------------|------------------------------------------|
+| `server`                | `LEGO_SERVER`                       | ACME directory URL                       |
+| `email`                 | `LEGO_EMAIL`                        | Account email address                    |
+| `challenge`             | `LEGO_CHALLENGE`                    | ACME challenge type, **required**: `dns-01`, `http-01`, or `dns-persist-01` |
+| `dns`                   | `LEGO_DNS`                          | lego DNS provider name (`dns-01` only)   |
+| `lego-version`          | `LEGO_VERSION`                      | Override lego version detection: auto, 4, or 5 |
+| `dns-resolvers`         | `LEGO_DNS_RESOLVERS`                | Resolver(s) for `dns-01`/`dns-persist-01` (host:port) |
+| `http-webroot`          | `LEGO_HTTP_WEBROOT`                 | `http-01` only: serve from this webroot instead of a standalone server |
+| `dns-persist-issuer`    | `LEGO_DNS_PERSIST_ISSUER_DOMAIN_NAME` | `dns-persist-01` only: override issuer-domain-name |
+| `dns-persist-until`     | `LEGO_DNS_PERSIST_PERSIST_UNTIL`    | `dns-persist-01` only: optional RFC3339 expiry for the TXT record |
+| `account-key-path`      | `LEGO_ACCOUNT_KEY_PATH`             | Store the account private key here instead of under `/var/lib/acme` |
+| `eab`                   | `LEGO_EAB`                          | Enable External Account Binding          |
+| `eab-kid`               | `LEGO_EAB_KID`                      | EAB key ID                               |
+| `eab-hmac`              | `LEGO_EAB_HMAC`                     | EAB HMAC key                             |
+| `pfx`                   | `LEGO_PFX`                          | Generate PKCS#12 alongside PEM files     |
+| `pfx-password`          | `LEGO_PFX_PASSWORD`                 | PKCS#12 password                         |
+| `pfx-format`            | `LEGO_PFX_FORMAT`                   | PKCS#12 hash format: RC2, DES, SHA256    |
 
 Use `--raw` to set arbitrary keys (e.g. DNS provider credentials):
 
 ```bash
 sudo lego.py config set --raw CLOUDFLARE_DNS_API_TOKEN abc123
 ```
+
+### Challenge types
+
+`LEGO_CHALLENGE` picks how lego proves domain control, per instance (it's
+read from the merged global+instance config, same as every other key).
+**There is no default** — `issue`/`renew-exec` refuse to run until it's
+set to one of:
+
+- **`dns-01`** — the original behaviour. Needs `LEGO_DNS` (a
+  [provider name](https://go-acme.github.io/lego/dns/)) and that provider's
+  API credentials, set with `config set --raw`. Supports wildcards; no
+  public-facing service required.
+- **`http-01`** — serves the challenge over port 80 (`lego`'s built-in
+  standalone server), or from an existing web server's docroot if
+  `LEGO_HTTP_WEBROOT` is set. No wildcard support. Nothing else to
+  configure.
+- **`dns-persist-01`** — see below. No DNS provider or API credentials at
+  all.
+
+### DNS-PERSIST-01
+
+[DNS-PERSIST-01](https://letsencrypt.org/2026/02/18/dns-persist-01) is a
+newer ACME challenge type (from
+[draft-ietf-acme-dns-persist](https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-01),
+supported by lego v5+) built around a *persistent* TXT record instead of a
+fresh one per issuance: you publish one `_validation-persist.<domain>`
+record, authorizing your ACME account, and every later issuance or renewal
+just re-checks that it's still there — no DNS changes, no DNS provider
+credentials, ever, on lego.py's side.
+
+**lego.py never creates, inspects, or modifies that record.** You deploy it
+yourself, out-of-band, before running `lego.py issue`:
+
+1. Set the challenge type and register the account:
+
+   ```bash
+   sudo lego.py config set challenge dns-persist-01
+   sudo lego.py account register
+   ```
+
+   This prints the account's URL (and where its private key lives), e.g.:
+
+   ```
+   account-url: https://acme-v02.api.letsencrypt.org/acme/acct/1234567890
+   key-path: /var/lib/acme/accounts/acme-v02.api.letsencrypt.org/you@example.com/you@example.com.key
+   ```
+
+2. Publish a TXT record at `_validation-persist.<domain>` containing that
+   URL, in your DNS zone, using whatever means you normally manage that
+   zone (lego.py is intentionally not involved here):
+
+   ```
+   _validation-persist.mysite.example.com. IN TXT "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234567890"
+   ```
+
+   (`letsencrypt.org` is Let's Encrypt's issuer-domain-name per their own
+   docs linked above — check your CA's documentation if using a different
+   one. Add `; policy=wildcard` if you need wildcard certs under this name,
+   or `; persistUntil=<unix-timestamp>` for an optional expiry — matching
+   `LEGO_DNS_PERSIST_PERSIST_UNTIL` below if you set it.)
+
+3. Once the record has propagated, issue normally:
+
+   ```bash
+   sudo lego.py issue mysite
+   ```
+
+If the record isn't in place yet when you run `issue`, lego falls back to
+prompting on stdin for you to create it — which only works from a real
+terminal, and will fail fast (not hang) under the unattended systemd timer.
+Deploying it up front as above avoids that path entirely, for both the
+first issuance and every renewal after.
 
 ### Per-instance config — `/etc/acme/<instance>.env`
 
@@ -193,15 +271,38 @@ Use `lego.py hook <instance>` to run the configured hook on demand against
 the instance's current certificate — useful for testing a hook script
 without waiting for (or forcing) an actual renewal.
 
+### Relocating the account private key
+
+By default lego keeps the ACME account private key under
+`/var/lib/acme/accounts/...` alongside everything else. Setting
+`LEGO_ACCOUNT_KEY_PATH` moves just that one file somewhere more tightly
+controlled — e.g. a separate backup set, or a directory with narrower
+access than the rest of the lego working directory:
+
+```bash
+sudo lego.py config set account-key-path /etc/acme/keys/letsencrypt.key
+```
+
+lego.py creates `/etc/acme/keys` (root-owned, `0700`) and the key file
+itself (root-owned, `0600`) at that path, migrating an existing key there
+if one already exists, and leaves a symlink in lego's own account
+directory pointing to it — lego reads and writes through that symlink
+transparently and never needs to know it moved. This runs automatically on
+every `issue`/`renew-exec`/`account register` invocation; everything else
+(`certificates/`, challenge state, etc.) stays under `/var/lib/acme/` as
+usual.
+
 ## Paths
 
 | Path                          | Purpose                              |
-|-------------------------------|--------------------------------------|
+|-------------------------------|---------------------------------------|
 | `/etc/acme/acme.conf`         | Global settings                      |
 | `/etc/acme/<instance>.env`    | Per-certificate overrides            |
+| `/etc/acme/keys/`             | Account key, if `LEGO_ACCOUNT_KEY_PATH` is set |
 | `/var/lib/acme/`              | lego working directory               |
 | `/var/lib/acme/certificates/` | Issued certificate files             |
 | `/etc/systemd/system/`        | systemd unit templates               |
+
 
 ## Renewal
 
