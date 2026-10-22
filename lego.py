@@ -1486,6 +1486,40 @@ def _read_account_url(conf: dict[str, str]) -> str | None:
     return (data.get("registration") or {}).get("accountURL") or None
 
 
+_DNS_PERSIST_DEFAULT_ISSUER = "letsencrypt.org"
+
+
+def _rfc3339_to_unix(value: str) -> int:
+    """Convert an RFC3339 UTC timestamp (as validated by _validate_rfc3339) to
+    the base-10 Unix timestamp the persistUntil TXT parameter requires on the
+    wire (draft-ietf-acme-dns-persist-01 section 4.1) — lego's own
+    --dns-persist.persist-until flag takes the RFC3339 form, but what actually
+    gets published in DNS is seconds-since-epoch.
+    """
+    dt = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def _dns_persist_txt_value(
+    account_url: str, conf: dict[str, str], wildcard: bool = False
+) -> str:
+    """Build the '_validation-persist' TXT record value for DNS-PERSIST-01.
+
+    Format is CAA issue-value syntax (RFC 8659 section 4.2), per
+    draft-ietf-acme-dns-persist-01: 'issuer-domain-name; tag=value; ...'.
+    Whether a given domain needs *wildcard* (policy=wildcard) depends on
+    DOMAINS content this function never sees, so callers should present both
+    variants rather than trying to infer it.
+    """
+    issuer = conf.get("LEGO_DNS_PERSIST_ISSUER_DOMAIN_NAME") or _DNS_PERSIST_DEFAULT_ISSUER
+    parts = [issuer, f"accounturi={account_url}"]
+    if wildcard:
+        parts.append("policy=wildcard")
+    if persist_until := conf.get("LEGO_DNS_PERSIST_PERSIST_UNTIL"):
+        parts.append(f"persistUntil={_rfc3339_to_unix(persist_until)}")
+    return "; ".join(parts)
+
+
 def _sync_account_key(
     conf: dict[str, str],
     output: Output,
@@ -1736,16 +1770,19 @@ def cmd_hook(args: argparse.Namespace, output: Output) -> int:
 
 
 def cmd_account_register(args: argparse.Namespace, output: Output) -> int:
-    """Register (if needed) the global ACME account and report its URL and key path.
+    """Register (if needed) the global ACME account and report its URL, key
+    path, and the ready-to-publish DNS-PERSIST-01 TXT record value(s).
 
     This exists for the DNS-PERSIST-01 workflow: that challenge's
     '_validation-persist.<domain>' TXT record must be deployed out-of-band,
     by hand, *before* running 'lego.py issue' — lego.py never creates,
     inspects, or modifies that record, and never needs DNS provider
-    credentials for it. This command only gets you the one piece of data
-    you can't invent yourself: the account's URL. See the README's
-    "DNS-PERSIST-01" section for the exact TXT record format to publish
-    with it.
+    credentials for it. This command assembles the TXT value for you (both
+    with and without 'policy=wildcard', since whether a domain needs the
+    wildcard variant isn't something this command can know) so you don't
+    have to hand-build the issue-value syntax yourself. See the README's
+    "DNS-PERSIST-01" section for the exact record name and the BIND
+    zone-file quoting format.
 
     Requires lego v5+ — the 'accounts' command group doesn't exist in v4.
     """
@@ -1814,11 +1851,15 @@ def cmd_account_register(args: argparse.Namespace, output: Output) -> int:
 
     output.step("account-url", url)
     output.step("key-path", str(key_path))
+    output.step("txt-value", _dns_persist_txt_value(url, conf))
+    output.step("txt-value-wildcard", _dns_persist_txt_value(url, conf, wildcard=True))
     output.step(
         "hint",
-        "For DNS-PERSIST-01, publish a TXT record at "
-        "_validation-persist.<domain> containing this account URL before"
-        " running 'lego.py issue' — see the README's DNS-PERSIST-01 section.",
+        "For DNS-PERSIST-01, publish one of the txt-value(s) above as a TXT"
+        " record at _validation-persist.<domain> — use the -wildcard variant"
+        " only if <domain> itself needs wildcard certs (e.g. *.example.com)."
+        " Do this before running 'lego.py issue' — see the README's"
+        " DNS-PERSIST-01 section for the BIND zone-file format.",
     )
     return 0
 
@@ -2203,17 +2244,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_account_register = account_subs.add_parser(
         "register",
-        help="register the ACME account and print its URL and key path",
+        help="register the ACME account and print its URL, key path, and TXT value(s)",
         description=textwrap.dedent(
             """\
             Registers the ACME account for LEGO_EMAIL/LEGO_SERVER (if not
-            already registered) and prints its account URL and private key
-            path.
+            already registered) and prints its account URL, private key
+            path, and the DNS-PERSIST-01 '_validation-persist' TXT record
+            value (both with and without 'policy=wildcard').
 
             Mainly useful for DNS-PERSIST-01, which needs the account URL to
-            put in the '_validation-persist.<domain>' TXT record you deploy
-            by hand — lego.py never touches DNS for that challenge. See the
-            README's "DNS-PERSIST-01" section for the exact record format.
+            put in that TXT record you deploy by hand — lego.py never
+            touches DNS for that challenge. See the README's
+            "DNS-PERSIST-01" section for the exact record name and the
+            BIND zone-file quoting format.
 
             Requires root and lego v5+.
             """

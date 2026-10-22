@@ -1189,6 +1189,55 @@ class TestReadAccountUrl(_AcmeWorkDirTestCase):
         self.assertIsNone(lego._read_account_url(self._conf))
 
 
+class TestRfc3339ToUnix(unittest.TestCase):
+    def test_known_timestamp(self):
+        self.assertEqual(lego._rfc3339_to_unix("2027-01-01T00:00:00Z"), 1798761600)
+
+    def test_epoch(self):
+        self.assertEqual(lego._rfc3339_to_unix("1970-01-01T00:00:00Z"), 0)
+
+
+class TestDnsPersistTxtValue(unittest.TestCase):
+    """_dns_persist_txt_value(): the '_validation-persist' TXT RDATA builder."""
+
+    _URL = "https://acme-v02.api.letsencrypt.org/acme/acct/1234567890"
+
+    def test_default_issuer_no_extras(self):
+        value = lego._dns_persist_txt_value(self._URL, {})
+        self.assertEqual(value, f"letsencrypt.org; accounturi={self._URL}")
+
+    def test_wildcard_adds_policy(self):
+        value = lego._dns_persist_txt_value(self._URL, {}, wildcard=True)
+        self.assertEqual(
+            value, f"letsencrypt.org; accounturi={self._URL}; policy=wildcard"
+        )
+
+    def test_custom_issuer_domain_name(self):
+        conf = {"LEGO_DNS_PERSIST_ISSUER_DOMAIN_NAME": "example-ca.org"}
+        value = lego._dns_persist_txt_value(self._URL, conf)
+        self.assertTrue(value.startswith("example-ca.org; "))
+
+    def test_persist_until_appended_as_unix_timestamp(self):
+        conf = {"LEGO_DNS_PERSIST_PERSIST_UNTIL": "2027-01-01T00:00:00Z"}
+        value = lego._dns_persist_txt_value(self._URL, conf)
+        self.assertEqual(
+            value, f"letsencrypt.org; accounturi={self._URL}; persistUntil=1798761600"
+        )
+
+    def test_wildcard_and_persist_until_combined_order(self):
+        conf = {"LEGO_DNS_PERSIST_PERSIST_UNTIL": "2027-01-01T00:00:00Z"}
+        value = lego._dns_persist_txt_value(self._URL, conf, wildcard=True)
+        self.assertEqual(
+            value,
+            f"letsencrypt.org; accounturi={self._URL}; policy=wildcard;"
+            " persistUntil=1798761600",
+        )
+
+    def test_no_persist_until_when_unset(self):
+        value = lego._dns_persist_txt_value(self._URL, {})
+        self.assertNotIn("persistUntil", value)
+
+
 class TestSyncAccountKey(_AcmeWorkDirTestCase):
     def setUp(self):
         super().setUp()

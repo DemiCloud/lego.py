@@ -230,26 +230,46 @@ yourself, out-of-band, before running `lego.py issue`:
    sudo lego.py account register
    ```
 
-   This prints the account's URL (and where its private key lives), e.g.:
+   This registers the account and prints everything needed to build the
+   record — its URL, its private key path, and both forms of the TXT
+   record value (lego.py doesn't know whether `<domain>` needs wildcard
+   certs, so it prints both rather than guessing):
 
    ```
    account-url: https://acme-v02.api.letsencrypt.org/acme/acct/1234567890
    key-path: /var/lib/acme/accounts/acme-v02.api.letsencrypt.org/you@example.com/you@example.com.key
+   txt-value: letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234567890
+   txt-value-wildcard: letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234567890; policy=wildcard
    ```
 
-2. Publish a TXT record at `_validation-persist.<domain>` containing that
-   URL, in your DNS zone, using whatever means you normally manage that
-   zone (lego.py is intentionally not involved here):
+   (`letsencrypt.org` is Let's Encrypt's issuer-domain-name per their own
+   docs linked above — check your CA's documentation if using a different
+   one, or override it with `dns-persist-issuer`. If
+   `LEGO_DNS_PERSIST_PERSIST_UNTIL` is set, both values also get a trailing
+   `; persistUntil=<unix-timestamp>` — converted from that RFC3339 config
+   value, since the TXT record itself requires the Unix-epoch form.)
+
+2. Publish one of those values — `txt-value` for a plain domain,
+   `txt-value-wildcard` only if `<domain>` itself needs wildcard certs
+   (e.g. `*.mysite.example.com`) — as a TXT record at
+   `_validation-persist.<domain>`, in your DNS zone, using whatever means
+   you normally manage that zone (lego.py is intentionally not involved
+   here). As a single-line record:
 
    ```
    _validation-persist.mysite.example.com. IN TXT "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234567890"
    ```
 
-   (`letsencrypt.org` is Let's Encrypt's issuer-domain-name per their own
-   docs linked above — check your CA's documentation if using a different
-   one. Add `; policy=wildcard` if you need wildcard certs under this name,
-   or `; persistUntil=<unix-timestamp>` for an optional expiry — matching
-   `LEGO_DNS_PERSIST_PERSIST_UNTIL` below if you set it.)
+   or, in BIND zone-file style (functionally identical — just split into
+   quoted chunks for readability):
+
+   ```
+   _validation-persist.mysite.example.com. IN TXT (
+     "letsencrypt.org;"
+     " accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234567890;"
+     " persistUntil=1798761600"
+   )
+   ```
 
 3. Once the record has propagated, issue normally:
 
